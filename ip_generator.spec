@@ -16,6 +16,7 @@ a = Analysis(
         'jinja2.runtime',
         'bram_generator',
         'pll_generator',
+        'stream_generator',
     ],
     hookspath=[],
     hooksconfig={},

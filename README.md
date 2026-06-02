@@ -1,6 +1,6 @@
 # IP-Generator
 
-IP-Generator is a companion toolset for **UFDE+**. It generates Verilog IP cores — primarily **Block RAM (BRAM)** and **Phase-Locked Loop (PLL)** — from high-level descriptions, which UFDE+ then instantiates in your design.
+IP-Generator is a companion toolset for **UFDE+**. It generates Verilog IP cores — **Block RAM (BRAM)**, **Phase-Locked Loop (PLL)**, and **Stream Wrapper** — from high-level descriptions, which UFDE+ then instantiates in your design.
 
 ---
 
@@ -10,6 +10,7 @@ IP-Generator is a companion toolset for **UFDE+**. It generates Verilog IP cores
 |-----------|-------|--------|
 | **BRAM IP** | MIF file (memory initialization) | `test.v` — synthesizable Verilog RAM module |
 | **PLL IP** | Divide ratio & gate count | `PLL_<divide>_<gates>.v` — clock multiplier module |
+| **Stream IP** | User Verilog module | wrapper + SIPO + PISO + BRAM + top (5 files) |
 
 > **Image → MIF** is a helper utility that produces initialization files for the BRAM generator. It converts PNG / JPG / BMP into the `*.mif` format consumed by `ip_main.py bram`.
 
@@ -24,14 +25,19 @@ IP-Generator/
 │
 │  === IP Generation Core ===
 │
-├── ip_main.py              # Unified CLI entry (bram / pll sub-commands)
+├── ip_main.py              # Unified CLI entry (bram / pll / stream sub-commands)
 ├── bram_generator.py       # BRAM generator engine
 ├── img2mif.py              # Image → MIF converter (feeds BRAM generator)
 ├── pll_generator.py        # PLL generator engine
+├── stream_generator.py     # Stream wrapper generator (SIPO/PISO/BRAM glue)
 │
 ├── templates/              # Jinja2 Verilog templates
 │   ├── bram_template.j2
-│   └── pll_template.j2
+│   ├── pll_template.j2
+│   ├── stream_sipo.j2
+│   ├── stream_piso.j2
+│   ├── stream_wrapper.j2
+│   └── stream_top.j2
 │
 ├── ip_generator.spec       # PyInstaller spec for ip_generator.exe
 └── img2mif.spec            # PyInstaller spec for img2mif.exe
@@ -56,7 +62,7 @@ $ pip install pyinstaller jinja2 Pillow
 UFDE calls two bundled executables. Build them with PyInstaller using the provided `.spec` files:
 
 ```bash
-# 1. Unified IP generator (BRAM + PLL)
+# 1. Unified IP generator (BRAM + PLL + Stream)
 $ pyinstaller ip_generator.spec
 
 # 2. Image → MIF converter
@@ -73,7 +79,7 @@ dist/
 
 ### Integration with UFDE
 
-Copy both executables into your `ufde-next` project directory (the exact location depends on how UFDE locates its helper tools; typically alongside the other bundled binaries). UFDE's IP Catalog will then invoke `ip_generator.exe` and `img2mif.exe` transparently when you configure BRAM or PLL instances.
+Copy both executables into your `ufde-next` project directory (the exact location depends on how UFDE locates its helper tools; typically alongside the other bundled binaries). UFDE's IP Catalog will then invoke `ip_generator.exe` and `img2mif.exe` transparently when you configure BRAM, PLL, or Stream instances.
 
 ---
 
@@ -158,7 +164,38 @@ $ python ip_main.py pll --all --output-dir ./generated
 | `divide` | 2, 4, 8, 16 | Clock divide ratio |
 | `gates` | 30, 50 | 30 = 30W (DLL primitive), 50 = 50W (DCM primitive) |
 
+### Stream IP
 
+Wraps a user Verilog module with SIPO + PISO + dual-port BRAM, exposing a parallel N-bit serial interface (DATA + CLK + STROBE / DATA + CLK + DATA_VALID). Auto-detects `start` / `done` / `busy` handshake ports.
+
+```bash
+# List modules and ports
+$ python ip_main.py stream --source *.v --print-modules
+
+# Generate wrapper for a user module
+$ python ip_main.py stream \
+    --source *.v \
+    --top matrix_mult_3x3 \
+    --input-port a0:8 \
+    --output-port c0:8 \
+    --bram-width 8 \
+    --bram-depth 512 \
+    --out-dir ./generated/
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--source` | *(required)* | Path to user Verilog source |
+| `--top` | *(required)* | Top module name to wrap |
+| `--input-port` | *(required)* | Input data port `name:width` (e.g. `a0:8`) |
+| `--output-port` | *(required)* | Output data port `name:width` (e.g. `c0:8`) |
+| `--bram-width` | 16 | BRAM data width |
+| `--bram-depth` | 256 | BRAM depth |
+| `--baud-div` | 2 | System clocks per PISO CLK half-period |
+| `--out-dir` | `.` | Output directory |
+| `--print-modules` | — | Print module list and exit |
+
+For a complete guide including protocol specification and simulation, see [STREAM_IP_GUIDE.md](STREAM_IP_GUIDE.md).
 
 ---
 

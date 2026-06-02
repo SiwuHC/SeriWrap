@@ -2,21 +2,28 @@
 """
 Unified IP Generator
 
-A unified entry point for generating BRAM and PLL IP modules.
+A unified entry point for generating BRAM, PLL, and Stream IP modules.
 This reduces bundle size by sharing the Jinja2 engine.
 
 Usage:
     # BRAM generation
     python ip_main.py bram <mif_file> [--output <file>]
-    
+
     # PLL generation
     python ip_main.py pll --divide <value> --gates <30|50> [--output <file>]
     python ip_main.py pll --all [--output-dir <dir>]
-    
+
+    # Stream wrapper generation
+    python ip_main.py stream --source <user.v> --top <module> \
+        --input-port <name>[:<width>] --output-port <name>[:<width>] \
+        --bram-width <W> --bram-depth <D> [--out-dir <dir>]
+    python ip_main.py stream --source <user.v> --print-modules
+
     # Show help
     python ip_main.py --help
     python ip_main.py bram --help
     python ip_main.py pll --help
+    python ip_main.py stream --help
 """
 
 import sys
@@ -26,6 +33,7 @@ from typing import Optional
 
 import bram_generator
 import pll_generator
+import stream_generator
 
 
 def handle_bram(args) -> int:
@@ -43,6 +51,40 @@ def handle_pll(args) -> int:
         result = pll_generator.generate_pll(args.divide, args.gates, args.output)
         print(json.dumps(result))
         return 0 if result['success'] else 1
+
+
+def handle_stream(args) -> int:
+    if args.print_modules:
+        result = stream_generator.parse_modules(args.source)
+    else:
+        # Validate required args for the generate path
+        missing = [k for k, v in {
+            'top': args.top, 'input-port': args.input_port,
+            'output-port': args.output_port, 'bram-width': args.bram_width,
+            'bram-depth': args.bram_depth,
+        }.items() if v is None]
+        if missing:
+            result = {
+                'success': False,
+                'error': f"Missing required arguments: {', '.join(missing)}",
+                'message': 'Missing required arguments',
+            }
+        else:
+            result = stream_generator.generate_stream_ip(
+                source_file=args.source,
+                top_module=args.top,
+                input_port=args.input_port,
+                output_port=args.output_port,
+                bram_width=args.bram_width,
+                bram_depth=args.bram_depth,
+                out_dir=args.out_dir,
+                baud_div=args.baud_div,
+                idle_timeout=args.idle_timeout,
+                include_sipo=not args.no_sipo,
+                include_piso=not args.no_piso,
+            )
+    print(json.dumps(result))
+    return 0 if result.get('success') else 1
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -119,7 +161,42 @@ Examples:
         default='.',
         help='Output directory for --all mode (default: current directory)'
     )
-    
+
+    # ----- stream subcommand -----
+    stream_parser = subparsers.add_parser(
+        'stream',
+        help='Wrap a user module with SIPO/PISO + BRAM to expose 3-wire serial I/O',
+        description=(
+            'Generate a stream-wrapped Verilog IP from a user module. '
+            'Produces <top>__stream_wrapper.v and <top>__stream_top.v '
+            'in --out-dir.'
+        ),
+    )
+    stream_parser.add_argument('--source', '-s', required=True,
+        help='Path to the user Verilog source file')
+    stream_parser.add_argument('--top', '-t',
+        help='Top module name inside the source file')
+    stream_parser.add_argument('--input-port',
+        help='Parallel input data port ("name" or "name:width")')
+    stream_parser.add_argument('--output-port',
+        help='Parallel output data port ("name" or "name:width")')
+    stream_parser.add_argument('--bram-width', type=int,
+        help='Width W of the dual-port BRAM')
+    stream_parser.add_argument('--bram-depth', type=int,
+        help='Depth D of the dual-port BRAM')
+    stream_parser.add_argument('--out-dir', type=str, default='.',
+        help='Output directory (default: current directory)')
+    stream_parser.add_argument('--baud-div', type=int, default=2,
+        help='BAUD_DIV parameter for the PISO module (default: 2 for sim)')
+    stream_parser.add_argument('--idle-timeout', type=int, default=2000,
+        help='IDLE_TIMEOUT parameter for the wrapper FSM (default: 2000)')
+    stream_parser.add_argument('--no-piso', action='store_true',
+        help='Skip the PISO + output BRAM (input-only streaming)')
+    stream_parser.add_argument('--no-sipo', action='store_true',
+        help='Skip the SIPO + input BRAM (output-only streaming)')
+    stream_parser.add_argument('--print-modules', action='store_true',
+        help='Parse --source and print discovered modules/ports as JSON, then exit')
+
     return parser
 
 
@@ -136,6 +213,8 @@ def main(args_list: Optional[list[str]] = None) -> int:
             return handle_bram(args)
         elif args.command == 'pll':
             return handle_pll(args)
+        elif args.command == 'stream':
+            return handle_stream(args)
         else:
             parser.print_help()
             return 1
