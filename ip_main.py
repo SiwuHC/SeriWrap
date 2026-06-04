@@ -59,8 +59,7 @@ def handle_stream(args) -> int:
     else:
         # Validate required args for the generate path
         missing = [k for k, v in {
-            'top': args.top, 'input-port': args.input_port,
-            'output-port': args.output_port, 'bram-width': args.bram_width,
+            'top': args.top, 'bram-width': args.bram_width,
             'bram-depth': args.bram_depth,
         }.items() if v is None]
         if missing:
@@ -73,8 +72,6 @@ def handle_stream(args) -> int:
             result = stream_generator.generate_stream_ip(
                 source_file=args.source,
                 top_module=args.top,
-                input_port=args.input_port,
-                output_port=args.output_port,
                 bram_width=args.bram_width,
                 bram_depth=args.bram_depth,
                 out_dir=args.out_dir,
@@ -83,6 +80,7 @@ def handle_stream(args) -> int:
                 include_sipo=not args.no_sipo,
                 include_piso=not args.no_piso,
                 debug=args.debug,
+                width=args.width or 0,
             )
     print(json.dumps(result))
     return 0 if result.get('success') else 1
@@ -177,10 +175,8 @@ Examples:
         help='Path to the user Verilog source file')
     stream_parser.add_argument('--top', '-t',
         help='Top module name inside the source file')
-    stream_parser.add_argument('--input-port',
-        help='Parallel input data port ("name" or "name:width")')
-    stream_parser.add_argument('--output-port',
-        help='Parallel output data port ("name" or "name:width")')
+    stream_parser.add_argument('--width', type=int, default=0,
+        help='Data port width (0 = auto-detect from module ports)')
     stream_parser.add_argument('--bram-width', type=int,
         help='Width W of the dual-port BRAM')
     stream_parser.add_argument('--bram-depth', type=int,

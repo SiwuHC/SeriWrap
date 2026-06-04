@@ -166,18 +166,16 @@ $ python ip_main.py pll --all --output-dir ./generated
 
 ### Stream IP
 
-Wraps a user Verilog module with SIPO + PISO + dual-port BRAM, exposing a parallel N-bit serial interface (DATA + CLK + STROBE / DATA + CLK + DATA_VALID). Auto-detects `start` / `done` / `busy` handshake ports.
+Wraps a user Verilog module with SIPO + PISO + dual-port BRAM, exposing a parallel N-bit serial interface (DATA + CLK + STROBE / DATA + CLK + DATA_VALID). Auto-detects data port width, input/output counts, and `start` / `done` / `busy` handshake ports. Use `--width` only if the module uses parameterized port widths that cannot be auto-detected.
 
 ```bash
 # List modules and ports
 $ python ip_main.py stream --source *.v --print-modules
 
-# Generate wrapper for a user module
+# Generate wrapper (width auto-detected from first data port)
 $ python ip_main.py stream \
     --source *.v \
     --top matrix_mult_3x3 \
-    --input-port a0:8 \
-    --output-port c0:8 \
     --bram-width 8 \
     --bram-depth 512 \
     --out-dir ./generated/
@@ -187,12 +185,12 @@ $ python ip_main.py stream \
 |-----------|---------|-------------|
 | `--source` | *(required)* | Path to user Verilog source |
 | `--top` | *(required)* | Top module name to wrap |
-| `--input-port` | *(required)* | Input data port `name:width` (e.g. `a0:8`) |
-| `--output-port` | *(required)* | Output data port `name:width` (e.g. `c0:8`) |
 | `--bram-width` | 16 | BRAM data width |
 | `--bram-depth` | 256 | BRAM depth |
+| `--width` | 0 (auto) | Data port width override (0 = auto-detect from module) |
 | `--baud-div` | 2 | System clocks per PISO CLK half-period |
 | `--out-dir` | `.` | Output directory |
+| `--debug` | — | Include overflow/idle/busy debug ports |
 | `--print-modules` | — | Print module list and exit |
 
 For a complete guide including protocol specification and simulation, see [STREAM_IP_GUIDE.md](STREAM_IP_GUIDE.md).

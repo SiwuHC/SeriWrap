@@ -282,21 +282,6 @@ def parse_modules(path: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-#  Port-name parsing (CLI side: "name" or "name:width")
-# =============================================================================
-
-def _parse_port_spec(spec: str) -> Tuple[str, Optional[int]]:
-    """Parse a 'name' or 'name:width' CLI argument."""
-    if ':' in spec:
-        name, width_s = spec.split(':', 1)
-
-        try:
-            return name.strip(), int(width_s)
-        except ValueError:
-            raise ValueError(f"Invalid port spec '{spec}': width must be an integer")
-    return spec.strip(), None
-
-
 # =============================================================================
 #  Generator
 # =============================================================================
@@ -339,8 +324,6 @@ def _port_connection(port: Port, width: int) -> str:
 def generate_stream_ip(
     source_file: str,
     top_module: str,
-    input_port: str,
-    output_port: str,
     bram_width: int,
     bram_depth: int,
     out_dir: str = '.',
@@ -349,30 +332,16 @@ def generate_stream_ip(
     include_sipo: bool = True,
     include_piso: bool = True,
     debug: bool = False,
+    width: int = 0,          # 0 = auto-detect, >0 = override
 ) -> Dict[str, Any]:
-    """Generate the three .v files for the stream wrapper.
+    """Generate the five .v files for the stream wrapper.
 
     Returns the standard {success, message, ...} dict. On success, also
     includes 'wrapper_file', 'top_file', 'bram_file', and 'files'.
-    """
 
-    try:
-        in_name, in_width_override = _parse_port_spec(input_port)
-        out_name, out_width_override = _parse_port_spec(output_port)
-        if not include_sipo and in_width_override is None:
-            return {
-                'success': False,
-                'error': 'When --no-sipo is set, --input-port must include ":width"',
-                'message': 'Cannot determine input port width without SIPO source',
-            }
-        if not include_piso and out_width_override is None:
-            return {
-                'success': False,
-                'error': 'When --no-piso is set, --output-port must include ":width"',
-                'message': 'Cannot determine output port width without PISO source',
-            }
-    except ValueError as e:
-        return {'success': False, 'error': str(e), 'message': str(e)}
+    If width=0, the data port width is auto-detected from the first
+    non-handshake data port in the user module.
+    """
 
     # Parse the user's Verilog
     parsed = parse_modules(source_file)
@@ -391,53 +360,25 @@ def generate_stream_ip(
                   used_parameter=p['used_parameter'],
                   array_count=p.get('array_count', 1)) for p in mod_dict['ports']]
 
-    # Resolve port widths (CLI override wins, then parsed, then default 1)
-    in_port = next((p for p in ports if p.name == in_name), None)
-    out_port = next((p for p in ports if p.name == out_name), None)
-    if in_port is None:
-        return {
-            'success': False,
-            'error': f"Input port '{in_name}' not found in module '{top_module}'",
-            'message': f"Input port '{in_name}' not found",
-        }
-    if out_port is None:
-        return {
-            'success': False,
-            'error': f"Output port '{out_name}' not found in module '{top_module}'",
-            'message': f"Output port '{out_name}' not found",
-        }
+    # Auto-detect port width from first data port (skip handshake ports)
+    if width <= 0:
+        handshake = {'clk', 'clock', 'rst_n', 'rst', 'reset', 'start', 'done', 'busy'}
+        in_ports = [p for p in ports if p.direction == 'input'
+                    and p.name.lower() not in handshake and p.width > 1]
+        out_ports = [p for p in ports if p.direction == 'output'
+                     and p.name.lower() not in handshake and p.width > 1]
+        if in_ports:
+            width = in_ports[0].width
+        elif out_ports:
+            width = out_ports[0].width
+        if width <= 0:
+            return {'success': False, 'error': 'Cannot auto-detect port width; use --width',
+                    'message': 'Width detection failed'}
 
-    in_port.width = in_width_override if in_width_override is not None else in_port.width
-    out_port.width = out_width_override if out_width_override is not None else out_port.width
-
-    # Width consistency: both data ports must match BRAM width
-    if include_sipo and include_piso:
-        if in_port.width != out_port.width:
-            return {
-                'success': False,
-                'error': f"Input port width ({in_port.width}) != output port width ({out_port.width}); both must match BRAM width",
-                'message': 'Input/output port width mismatch',
-            }
-        if in_port.width != bram_width:
-            return {
-                'success': False,
-                'error': f"Port width ({in_port.width}) != BRAM width ({bram_width})",
-                'message': 'Port/BRAM width mismatch',
-            }
-    elif include_sipo:
-        if in_port.width != bram_width:
-            return {
-                'success': False,
-                'error': f"Input port width ({in_port.width}) != BRAM width ({bram_width})",
-                'message': 'Input port/BRAM width mismatch',
-            }
-    elif include_piso:
-        if out_port.width != bram_width:
-            return {
-                'success': False,
-                'error': f"Output port width ({out_port.width}) != BRAM width ({bram_width})",
-                'message': 'Output port/BRAM width mismatch',
-            }
+    if width != bram_width:
+        return {'success': False,
+                'error': f'Port width ({width}) != BRAM width ({bram_width})',
+                'message': 'Width/BRAM mismatch'}
 
     # BRAM validation
     err = _validate_bram(bram_width, bram_depth)
@@ -608,8 +549,6 @@ def generate_stream_ip(
         'wrapper_module': f"{top_module}__stream_wrapper",
         'bram_module': bram_name,
         'user_source': os.path.basename(source_file),
-        'in_port': in_name,
-        'out_port': out_name,
         'width': bram_width,
         'WIDTH': bram_width,
         'depth': bram_depth,
@@ -703,8 +642,7 @@ def generate_stream_ip(
         'files': [bram_path, sipo_path, piso_path, wrapper_path, top_path],
         'message': (
             f"Stream wrapper generated for {top_module} "
-            f"({bram_width}x{bram_depth} BRAM, "
-            f"in={in_name}, out={out_name})"
+            f"({bram_width}x{bram_depth} BRAM, width={width})"
         ),
     }
 
