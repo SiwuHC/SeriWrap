@@ -82,6 +82,7 @@ def handle_stream(args) -> int:
                 idle_timeout=args.idle_timeout,
                 include_sipo=not args.no_sipo,
                 include_piso=not args.no_piso,
+                debug=args.debug,
             )
     print(json.dumps(result))
     return 0 if result.get('success') else 1
@@ -194,6 +195,8 @@ Examples:
         help='Skip the PISO + output BRAM (input-only streaming)')
     stream_parser.add_argument('--no-sipo', action='store_true',
         help='Skip the SIPO + input BRAM (output-only streaming)')
+    stream_parser.add_argument('--debug', action='store_true',
+        help='Include overflow/idle/busy debug status ports on the top module')
     stream_parser.add_argument('--print-modules', action='store_true',
         help='Parse --source and print discovered modules/ports as JSON, then exit')
 

@@ -20,12 +20,14 @@ module {{ top_module }}__stream_top (
     // Serial output to Rabbit
     output wire [{{ width - 1 }}:0]  s_data_out,
     output wire                  s_clk_out,
-    output wire                  s_data_valid,
-
-    // Status
+    output wire                  s_data_valid
+{%- if debug %}
+,
+    // Debug status
     output wire                  overflow,
     output wire                  idle,
     output wire                  busy
+{%- endif %}
 );
 
     parameter WIDTH = {{ width }};
@@ -39,10 +41,12 @@ module {{ top_module }}__stream_top (
         .s_strobe_in  (s_strobe_in),
         .s_data_out   (s_data_out),
         .s_clk_out    (s_clk_out),
-        .s_data_valid (s_data_valid),
-        .overflow     (overflow),
-        .idle         (idle),
-        .busy         (busy)
+        .s_data_valid (s_data_valid)
+{%- if debug %}
+       ,.overflow     (overflow)
+       ,.idle         (idle)
+       ,.busy         (busy)
+{%- endif %}
     );
 
 endmodule

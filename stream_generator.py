@@ -348,6 +348,7 @@ def generate_stream_ip(
     idle_timeout: int = 2000,
     include_sipo: bool = True,
     include_piso: bool = True,
+    debug: bool = False,
 ) -> Dict[str, Any]:
     """Generate the three .v files for the stream wrapper.
 
@@ -634,6 +635,7 @@ def generate_stream_ip(
         'output_count_idx_w': output_count_idx_w,
         'piso_result_count': piso_result_count,
         'generation_date': datetime.now().strftime('%Y.%m.%d'),
+        'debug': debug,
     }
 
     top_ctx: Dict[str, Any] = {
@@ -643,6 +645,7 @@ def generate_stream_ip(
         'width':  bram_width,
         'WIDTH':  bram_width,
         'depth':  bram_depth,
+        'debug': debug,
     }
 
     # Render and write
