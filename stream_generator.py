@@ -749,6 +749,14 @@ def generate_stream_ip(
                   used_parameter=p['used_parameter'],
                   array_count=p.get('array_count', 1)) for p in mod_dict['ports']]
 
+    # Apply --width override: for ports with unresolved parameterized widths,
+    # use the user-supplied value.  This affects only ports where the parser
+    # returned width=1 with used_parameter=True.
+    if width > 1:
+        for p in ports:
+            if p.used_parameter and p.direction in ('input', 'output'):
+                p.width = width
+
     if control_inputs is None:
         control_inputs = []
     if control_outputs is None:
@@ -924,10 +932,28 @@ def generate_stream_ip(
         addr_w = max(addr_w, (_addr_w(regfile_max) if regfile_max > 0 else addr_w))
 
     # ── Asymmetric baud rates ────────────────────────────────────────
-    if baud_div_in is None:
-        baud_div_in = baud_div
-    if baud_div_out is None:
-        baud_div_out = baud_div
+    # When neither is specified, auto-balance based on I/O ratio so the
+    # serial transfer time of each side is proportional to its data volume.
+    if baud_div_in is None and baud_div_out is None:
+        if input_count > 0 and output_count > 0:
+            ratio = input_count / output_count
+            if ratio >= 4.0:
+                # Input-heavy: keep input at default rate, relax output
+                baud_div_in  = baud_div
+                baud_div_out = min(baud_div * max(int(ratio / 2), 1), 256)
+            elif ratio <= 0.25:
+                # Output-heavy: keep output at default rate, relax input
+                baud_div_in  = min(baud_div * max(int(1.0 / ratio / 2), 1), 256)
+                baud_div_out = baud_div
+            else:
+                baud_div_in = baud_div_out = baud_div
+        else:
+            baud_div_in = baud_div_out = baud_div
+    else:
+        if baud_div_in is None:
+            baud_div_in = baud_div
+        if baud_div_out is None:
+            baud_div_out = baud_div
 
     # ── Index widths ──────────────────────────────────────────────────
     def _idx_w(n: int) -> int:
