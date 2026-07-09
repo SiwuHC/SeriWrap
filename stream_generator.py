@@ -403,6 +403,8 @@ def _render(template_dir: str, name: str, ctx: Dict[str, Any]) -> str:
         trim_blocks=True,
         lstrip_blocks=True,
     )
+    env.globals['range'] = range
+    env.globals['len'] = len
     return env.get_template(f'templates/{name}').render(**ctx)
 
 
@@ -446,6 +448,187 @@ def _compute_chunks(data_ports: List[Dict], bram_width: int) -> Tuple[List[Dict]
     return chunked, bram_idx
 
 
+def _compute_chunks_binpack(data_ports: List[Dict], bram_width: int) -> Tuple[List[Dict], int]:
+    """Break heterogeneous-width data ports into BRAM-width chunks using FFD bin-packing.
+
+    Unlike the greedy sequential allocator, this packs narrow ports (width < bram_width)
+    into shared BRAM entries, reducing INPUT_COUNT/OUTPUT_COUNT.
+
+    Algorithm: First-Fit Decreasing (FFD)
+      1. Split ports wider than bram_width into full-width chunks, leaving one remainder.
+      2. Collect all remainder chunks and narrow ports as "items".
+      3. Sort items by width descending.
+      4. For each item, find the first BRAM entry with ≥ item.width free bits;
+         if none, create a new entry.
+    """
+    # Phase 1: separate full-width chunks from remainders
+    class _Item:
+        __slots__ = ('port_name', 'bit_hi', 'bit_lo', 'width')
+        def __init__(self, port_name, bit_hi, bit_lo):
+            self.port_name = port_name
+            self.bit_hi = bit_hi
+            self.bit_lo = bit_lo
+            self.width = bit_hi - bit_lo + 1
+
+    full_chunks: List[Dict] = []   # port-level entries (reserve bram_idx later)
+    narrow_items: List[_Item] = []
+
+    for p in data_ports:
+        pw = p['width']
+        n_full = pw // bram_width
+        remainder = pw % bram_width
+
+        # Full-width chunks: each occupies exactly one BRAM entry
+        for c in range(n_full):
+            lo = c * bram_width
+            hi = lo + bram_width - 1
+            full_chunks.append({
+                'port_name': p['name'],
+                'port_bit_hi': hi,
+                'port_bit_lo': lo,
+                'width': bram_width,
+                'is_full': True,
+            })
+
+        # Remainder (or the whole port if it's narrow)
+        if remainder > 0:
+            narrow_items.append(_Item(p['name'], pw - 1, pw - remainder))
+        elif n_full == 0:
+            # Port is entirely narrow
+            narrow_items.append(_Item(p['name'], pw - 1, 0))
+
+    # Phase 2: sort narrow items by width descending
+    narrow_items.sort(key=lambda it: it.width, reverse=True)
+
+    # Phase 3: FFD bin-packing
+    # Each bin is a BRAM entry: free_bits is the remaining capacity.
+    bins: List[List[_Item]] = []
+
+    for item in narrow_items:
+        placed = False
+        for b in bins:
+            used = sum(it.width for it in b)
+            if bram_width - used >= item.width:
+                b.append(item)
+                placed = True
+                break
+        if not placed:
+            bins.append([item])
+
+    # Phase 4: assemble chunked output
+    # Full chunks get bram_idx first, then bins
+    chunked: List[Dict] = []
+    port_map: Dict[str, List[Dict]] = {}  # port_name → [chunks]
+
+    bram_idx = 0
+
+    # Full chunks: one per entry
+    for fc in full_chunks:
+        chunk = {
+            'bram_idx': bram_idx,  'bram_hi': bram_width - 1, 'bram_lo': 0,
+            'port_hi': fc['port_bit_hi'], 'port_lo': fc['port_bit_lo'],
+        }
+        port_map.setdefault(fc['port_name'], []).append(chunk)
+        bram_idx += 1
+
+    # Bin-packed items
+    for b in bins:
+        bit_cursor = 0
+        for item in b:
+            chunk = {
+                'bram_idx': bram_idx,
+                'bram_hi': bit_cursor + item.width - 1,
+                'bram_lo': bit_cursor,
+                'port_hi': item.bit_hi,
+                'port_lo': item.bit_lo,
+            }
+            bit_cursor += item.width
+            port_map.setdefault(item.port_name, []).append(chunk)
+        bram_idx += 1
+
+    # Reconstruct per-port chunk lists in declaration order
+    for p in data_ports:
+        chunks = port_map.get(p['name'], [])
+        chunked.append({
+            'name': p['name'],
+            'width': p['width'],
+            'array_count': p.get('array_count', 1),
+            'chunks': chunks,
+        })
+
+    return chunked, bram_idx
+
+
+def _get_pipeline_depth(bram_type: str) -> int:
+    """Return LAUNCH pipeline depth (cycles per BRAM read) for a given BRAM type.
+
+    7-series BRAMs (ramb18e1/ramb36e1) need 3 cycles due to ENB-to-DOB settling.
+    Older Spartan-6 primitives and generic/distributed RAM need only 1 cycle.
+    A register-file path (depth=0) eliminates LAUNCH entirely.
+    """
+    if bram_type in ('ramb18e1', 'ramb36e1'):
+        return 3
+    elif bram_type in ('ram4s', 'ram8b'):
+        return 1
+    else:
+        return 1  # generic, or unknown
+
+
+_REGISTER_THRESHOLD_BITS = 384  # Max total buffered bits for register-file path.
+                            # Kernels with ≤ 384 bits per side use zero-BRAM mode.
+                            # 384 bits = 48 FFs at 8-bit or 12 FFs at 32-bit.
+
+
+def _should_use_reg_file(chunk_count: int, bram_width: int) -> bool:
+    """Decide whether to use a register file instead of BRAM for the input path."""
+    if _REGISTER_THRESHOLD_BITS <= 0:
+        return False
+    return chunk_count * bram_width <= _REGISTER_THRESHOLD_BITS
+
+
+def _auto_bram_config(
+    data_input_ports: List[Dict],
+    data_output_ports: List[Dict],
+    bram_type: str,
+) -> Tuple[int, int]:
+    """Automatically select optimal (bram_width, bram_depth) from valid combinations.
+
+    Objective: minimize INPUT_COUNT + OUTPUT_COUNT (proxy for total cycle count).
+    Subject to: depth >= max(input_count, output_count), width >= max(port_width).
+
+    Returns (width, depth). Falls back to (8, 512) if no valid combo found.
+    """
+    all_ports = data_input_ports + data_output_ports
+    if not all_ports:
+        return 8, 512
+
+    max_port_w = max(p['width'] for p in all_ports)
+
+    valid_set = bram_generator.BRAM_TYPES[bram_type]['valid_combinations']
+    if valid_set is None:
+        # generic type: accept any, choose based on port widths
+        candidate_w = max(max_port_w, 8)
+        return candidate_w, 512
+
+    best_w, best_d = 8, 512
+    best_cost = 10**9
+
+    for w, d in valid_set:
+        if w < max_port_w:
+            continue
+        # Compute chunk counts for this width
+        _, in_count = _compute_chunks(data_input_ports, w)
+        _, out_count = _compute_chunks(data_output_ports, w)
+        if max(in_count, out_count) > d:
+            continue
+        cost = in_count + out_count
+        if cost < best_cost:
+            best_cost = cost
+            best_w, best_d = w, d
+
+    return best_w, best_d
+
+
 def generate_stream_ip(
     source_file: str,
     top_module: str,
@@ -453,6 +636,8 @@ def generate_stream_ip(
     bram_depth: int,
     out_dir: str = '.',
     baud_div: int = 2,
+    baud_div_in: Optional[int] = None,
+    baud_div_out: Optional[int] = None,
     idle_timeout: int = 2000,
     include_sipo: bool = True,
     include_piso: bool = True,
@@ -468,6 +653,7 @@ def generate_stream_ip(
     numeric_width: int = 32,
     handshake_ports: Optional[Dict[str, List[str]]] = None,
     sync_mode: bool = False,
+    use_binpack: bool = False,
 ) -> Dict[str, Any]:
     """Generate stream wrapper Verilog files for a user module.
 
@@ -491,6 +677,11 @@ def generate_stream_ip(
     FSM is otherwise identical — the bridge is a drop-in replacement
     for SIPO.  Requires adapters to include a 'ps2' binding with
     key_state output.
+
+    If bram_width=0, automatically selects optimal (width, depth) from
+    the BRAM type's valid combinations.  use_binpack enables FFD
+    bin-packing port marshaling.  baud_div_in/out allow asymmetric
+    serial rates for input vs output.
     """
 
     # ── Resolve input_source / trigger_key syntax ────────────────────
@@ -576,13 +767,23 @@ def generate_stream_ip(
         for pname in ad.get('ports', []):
             adapter_claimed_ports[pname] = ad
 
+    # ── Auto-select BRAM config if width=0 ─────────────────────────
+    # Must run BEFORE validation since auto-config produces valid values.
+    if bram_width <= 0:
+        # data_input_ports / data_output_ports aren't computed yet at this
+        # point.  We parse the module first (port classification below),
+        # then run auto-config, then validate.  Move auto-config after
+        # port classification.
+        pass
+
     # ── BRAM validation ───────────────────────────────────────────────
-    err = _validate_bram(bram_width, bram_depth, bram_type)
-    if err:
-        return {'success': False, 'error': err, 'message': err}
+    if bram_width > 0:  # only validate if width is user-specified
+        err = _validate_bram(bram_width, bram_depth, bram_type)
+        if err:
+            return {'success': False, 'error': err, 'message': err}
 
     # ── BRAM depth check (adapter mode) ───────────────────────────────
-    if input_source_norm == 'adapter':
+    if input_source_norm == 'adapter' and bram_width > 0:
         bram_depth_min = (numeric_width + bram_width - 1) // bram_width
         if bram_depth < bram_depth_min:
             return {
@@ -678,9 +879,55 @@ def generate_stream_ip(
             }
         data_input_ports = []   # ignore any data_input_ports — bridge supplies
 
+    # ── Auto-select BRAM config if width=0 ─────────────────────────
+    if bram_width <= 0:
+        bram_width, bram_depth = _auto_bram_config(
+            data_input_ports, data_output_ports, bram_type,
+        )
+        # Recompute addr_w for the new depth and validate result
+        addr_w = _addr_w(bram_depth)
+        err = _validate_bram(bram_width, bram_depth, bram_type)
+        if err:
+            return {'success': False, 'error': err, 'message': err}
+
     # ── Compute heterogeneous chunks ──────────────────────────────────
-    input_chunked, input_count = _compute_chunks(data_input_ports, bram_width)
-    output_chunked, output_count = _compute_chunks(data_output_ports, bram_width)
+    chunk_fn = _compute_chunks_binpack if use_binpack else _compute_chunks
+    input_chunked, input_count = chunk_fn(data_input_ports, bram_width)
+    output_chunked, output_count = chunk_fn(data_output_ports, bram_width)
+
+    # Flatten chunk lists for template iteration (needed by bin-packing
+    # where multiple ports may share a BRAM entry).
+    input_chunks_flat = []
+    for p in input_chunked:
+        for c in p['chunks']:
+            c_flat = dict(c)
+            c_flat['port_name'] = p['name']
+            input_chunks_flat.append(c_flat)
+    input_chunks_flat.sort(key=lambda c: c['bram_idx'])
+
+    output_chunks_flat = []
+    for p in output_chunked:
+        for c in p['chunks']:
+            c_flat = dict(c)
+            c_flat['port_name'] = p['name']
+            c_flat['port_width'] = p['width']
+            output_chunks_flat.append(c_flat)
+    output_chunks_flat.sort(key=lambda c: c['bram_idx'])
+
+    # ── Adaptive storage selection ────────────────────────────────────
+    use_reg_file_in = _should_use_reg_file(input_count, bram_width) and input_count > 0
+    use_reg_file_out = _should_use_reg_file(output_count, bram_width) and output_count > 0
+    pipeline_depth = _get_pipeline_depth(bram_type) if not use_reg_file_in else 0
+    # For register-file mode, SIPO/PISO address width is based on chunk count
+    if use_reg_file_in or use_reg_file_out:
+        regfile_max = max(input_count, output_count)
+        addr_w = max(addr_w, (_addr_w(regfile_max) if regfile_max > 0 else addr_w))
+
+    # ── Asymmetric baud rates ────────────────────────────────────────
+    if baud_div_in is None:
+        baud_div_in = baud_div
+    if baud_div_out is None:
+        baud_div_out = baud_div
 
     # ── Index widths ──────────────────────────────────────────────────
     def _idx_w(n: int) -> int:
@@ -690,16 +937,18 @@ def generate_stream_ip(
     input_count_idx_w  = _idx_w(input_count)  if user_has_handshake else 1
     output_count_idx_w = _idx_w(output_count) if user_has_handshake else 1
 
-    # ── Generate BRAM IP ──────────────────────────────────────────────
+    # ── Generate BRAM IP (skip if using register-file for both sides) ─
     bram_name = f"{top_module}__stream_bram"
-    bram_result = bram_generator.generate_bram_ip(
-        module_name=bram_name,
-        width_A=bram_width, depth_A=bram_depth,
-        width_B=bram_width, depth_B=bram_depth,
-        raw_data_array=[0] * bram_depth,
-        bram_type=bram_type,
-    )
-    if not bram_result.get('success'):
+    bram_result = None
+    if not (use_reg_file_in and use_reg_file_out):
+        bram_result = bram_generator.generate_bram_ip(
+            module_name=bram_name,
+            width_A=bram_width, depth_A=bram_depth,
+            width_B=bram_width, depth_B=bram_depth,
+            raw_data_array=[0] * bram_depth,
+            bram_type=bram_type,
+        )
+    if bram_result and not bram_result.get('success'):
         return {
             'success': False,
             'error': f"BRAM generation failed: {bram_result.get('error')}",
@@ -719,6 +968,8 @@ def generate_stream_ip(
         'depth': bram_depth,
         'addr_w': addr_w,
         'baud_div': baud_div,
+        'baud_div_in': baud_div_in,
+        'baud_div_out': baud_div_out,
         'idle_timeout': idle_timeout,
         'user_has_handshake': user_has_handshake,
         'control_input_ports': control_input_ports,
@@ -728,12 +979,11 @@ def generate_stream_ip(
         'data_output_ports': data_output_ports,
         'input_chunked': input_chunked,
         'output_chunked': output_chunked,
+        'input_chunks_flat': input_chunks_flat,
+        'output_chunks_flat': output_chunks_flat,
         'start_port': start_port or 'start',
         'done_port': done_port or 'done',
         'busy_port': busy_port or 'busy',
-        # When the user module actually has a clock/reset port we use the
-        # detected name; otherwise we leave it as None so the wrapper
-        # template can skip emitting the corresponding .clk/.rst_n line.
         'clock_port': clock_port,
         'reset_port': reset_port,
         'has_clock_port': clock_port is not None,
@@ -750,6 +1000,11 @@ def generate_stream_ip(
         'trigger_key': trigger_key_norm,
         'trigger_bit': TRIGGER_BIT.get(trigger_key_norm, 40) if input_source_norm == 'adapter' else 0,
         'numeric_width': numeric_width,
+        # Optimization parameters
+        'pipeline_depth': pipeline_depth,
+        'use_reg_file_in': use_reg_file_in,
+        'use_reg_file_out': use_reg_file_out,
+        'use_binpack': use_binpack,
     }
 
     wrapper_ctx = dict(shared_ctx)
@@ -779,10 +1034,7 @@ def generate_stream_ip(
         'width':  bram_width,
         'count':  input_count,
         'addr_w': addr_w,
-        # Async FIFO depth: default 8 entries (FIFO_ADDR_W=3).  This
-        # gives ~8 byte buffer between the s_clk_in producer and the
-        # system-clock consumer — more than enough for the 115200-baud
-        # Rabbit case, while costing only ~16 FFs.
+        'baud_div': baud_div_in,
         'fifo_addr_w': 3,
     }
     piso_ctx = {
@@ -790,7 +1042,7 @@ def generate_stream_ip(
         'generation_date': gen_date,
         'width':    bram_width,
         'count':    output_count,
-        'baud_div': baud_div,
+        'baud_div': baud_div_out,
         'addr_w':   addr_w,
     }
 
@@ -821,11 +1073,17 @@ def generate_stream_ip(
     bridge_path = os.path.join(out_dir, f"{top_module}__stream_bridge.v")
     piso_path = os.path.join(out_dir, f"{top_module}__stream_piso.v")
 
+    use_regfile = (use_reg_file_in and use_reg_file_out)  # only when both sides qualify
     if pingpong:
         wrapper_path = os.path.join(out_dir, f"{top_module}__stream_wrapper.v")
         top_path     = os.path.join(out_dir, f"{top_module}__stream_top.v")
         wrapper_tmpl = 'stream_wrapper_pingpong.j2'
         top_tmpl     = 'stream_top_pingpong.j2'
+    elif use_regfile:
+        wrapper_path = os.path.join(out_dir, f"{top_module}__stream_wrapper.v")
+        top_path     = os.path.join(out_dir, f"{top_module}__stream_top.v")
+        wrapper_tmpl = 'stream_wrapper_regfile.j2'
+        top_tmpl     = 'stream_top.j2'
     else:
         wrapper_path = os.path.join(out_dir, f"{top_module}__stream_wrapper.v")
         top_path     = os.path.join(out_dir, f"{top_module}__stream_top.v")
@@ -853,15 +1111,11 @@ def generate_stream_ip(
              open(async_fifo_dst, 'w', encoding='utf-8') as fdst:
             fdst.write(fsrc.read())
 
-    files_written = [bram_path, piso_path, wrapper_path, top_path,
+    files_written = [piso_path, wrapper_path, top_path,
                      os.path.join(out_dir, 'stream_async_fifo.v')]
+    if bram_result is not None:
+        files_written.insert(0, bram_path)
     if input_source_norm == 'adapter':
-        # Bridge replaces SIPO.  We always keep the BRAM instance for
-        # sanity (the wrapper would never read it; it's an unused cost
-        # of ~1 BRAM tile, but it keeps the wrapper structurally identical
-        # to the regular path).  Actually for adapter mode we don't need
-        # an input BRAM at all — omit it via the `input_count > 0` guards
-        # in stream_wrapper.j2.
         files_written.append(bridge_path)
     else:
         files_written.append(src_path)
@@ -869,8 +1123,9 @@ def generate_stream_ip(
         files_written.append(os.path.join(out_dir, f"device_adapter_{ad['name']}.v"))
 
     try:
-        with open(bram_path, 'w', encoding='utf-8') as f:
-            f.write(_ensure_trailing_newline(bram_result['verilog_code']))
+        if bram_result is not None:
+            with open(bram_path, 'w', encoding='utf-8') as f:
+                f.write(_ensure_trailing_newline(bram_result['verilog_code']))
         if input_source_norm == 'adapter':
             with open(bridge_path, 'w', encoding='utf-8') as f:
                 f.write(_ensure_trailing_newline(_render(template_dir, 'stream_bridge.j2', bridge_ctx)))
@@ -897,7 +1152,7 @@ def generate_stream_ip(
         'success': True,
         'wrapper_file': wrapper_path,
         'top_file': top_path,
-        'bram_file': bram_path,
+        'bram_file': bram_path if bram_result is not None else None,
         'src_file': src_path,
         'piso_file': piso_path,
         'files': files_written,

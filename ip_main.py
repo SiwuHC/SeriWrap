@@ -13,10 +13,10 @@ Usage:
     python ip_main.py pll --divide <value> --gates <30|50> [--output <file>]
     python ip_main.py pll --all [--output-dir <dir>]
 
-    # Stream wrapper generation
+    # Stream wrapper generation (auto BRAM config: --bram-width 0)
     python ip_main.py stream --source <user.v> --top <module> \
-        --input-port <name>[:<width>] --output-port <name>[:<width>] \
-        --bram-width <W> --bram-depth <D> [--out-dir <dir>]
+        --bram-width <W> --bram-depth <D> [--out-dir <dir>] [--binpack]
+    python ip_main.py stream --source <user.v> --top <module> --bram-width 0
     python ip_main.py stream --source <user.v> --print-modules
 
     # Show help
@@ -96,10 +96,13 @@ def handle_stream(args) -> int:
             handshake_ports=_load_handshake_ports(args),
         )
     else:
+        # bram-depth is optional when bram-width=0 (auto mode)
+        auto_bram = (args.bram_width is not None and args.bram_width == 0)
         missing = [k for k, v in {
             'top': args.top, 'bram-width': args.bram_width,
-            'bram-depth': args.bram_depth,
         }.items() if v is None]
+        if not auto_bram and args.bram_depth is None:
+            missing.append('bram-depth')
         if missing:
             result = {
                 'success': False,
@@ -125,10 +128,12 @@ def handle_stream(args) -> int:
             result = stream_generator.generate_stream_ip(
                 source_file=args.source,
                 top_module=args.top,
-                bram_width=args.bram_width,
-                bram_depth=args.bram_depth,
+                bram_width=args.bram_width if args.bram_width is not None else 0,
+                bram_depth=args.bram_depth if args.bram_depth is not None else 512,
                 out_dir=args.out_dir,
                 baud_div=args.baud_div,
+                baud_div_in=getattr(args, 'baud_div_in', None),
+                baud_div_out=getattr(args, 'baud_div_out', None),
                 idle_timeout=args.idle_timeout,
                 include_sipo=not args.no_sipo,
                 include_piso=not args.no_piso,
@@ -143,6 +148,7 @@ def handle_stream(args) -> int:
                 numeric_width=args.numeric_width,
                 handshake_ports=_load_handshake_ports(args),
                 sync_mode=args.sync_mode,
+                use_binpack=getattr(args, 'binpack', False),
             )
     print(json.dumps(result))
     return 0 if result.get('success') else 1
@@ -247,10 +253,6 @@ Examples:
         help='Top module name inside the source file')
     stream_parser.add_argument('--width', type=int, default=0,
         help='Data port width (0 = auto-detect from module ports)')
-    stream_parser.add_argument('--bram-width', type=int,
-        help='Width W of the dual-port BRAM')
-    stream_parser.add_argument('--bram-depth', type=int,
-        help='Depth D of the dual-port BRAM')
     stream_parser.add_argument('--out-dir', type=str, default='.',
         help='Output directory (default: current directory)')
     stream_parser.add_argument('--baud-div', type=int, default=2,
@@ -314,6 +316,20 @@ Examples:
         help='Comma-separated done port names (overrides --handshake-config).')
     stream_parser.add_argument('--busy-ports', type=str, default=None,
         help='Comma-separated busy port names (overrides --handshake-config).')
+    stream_parser.add_argument('--baud-div-in', type=int, default=None,
+        help='SIPO input baud divider (default: same as --baud-div). '
+             'Lower values increase input bandwidth.')
+    stream_parser.add_argument('--baud-div-out', type=int, default=None,
+        help='PISO output baud divider (default: same as --baud-div). '
+             'Higher values reduce output pin toggling.')
+    stream_parser.add_argument('--binpack', action='store_true',
+        help='Use FFD bin-packing port marshaling to reduce BRAM entry count '
+             'by packing narrow ports into shared entries.')
+    stream_parser.add_argument('--bram-width', '-w', type=int, default=None,
+        help='BRAM data width (default: 16). Set to 0 for auto-selection from '
+             'valid (width,depth) combinations of the chosen --bram-type.')
+    stream_parser.add_argument('--bram-depth', type=int, default=None,
+        help='BRAM depth (optional with --bram-width 0, auto-selected).')
 
     return parser
 

@@ -207,7 +207,11 @@ module {{ wrapper_module }} #(
 {% for p in input_chunked %}
     wire [{{ p.width - 1 }}:0] user_in_w_{{ p.name }};
 {% for c in p.chunks %}
+{% if c.port_hi is defined %}
+    assign user_in_w_{{ p.name }}[{{ c.port_hi }}:{{ c.port_lo }}] = in_bram_buf[{{ c.bram_idx }}][{{ c.bram_hi }}:{{ c.bram_lo }}];
+{% else %}
     assign user_in_w_{{ p.name }}[{{ c.hi }}:{{ c.lo }}] = in_bram_buf[{{ c.bram_idx }}][{{ c.hi - c.lo }}:0];
+{% endif %}
 {% endfor %}
 {% endfor %}
 
@@ -220,6 +224,15 @@ module {{ wrapper_module }} #(
     assign ctrl_{{ cp.name }} = user_ctrl_out_{{ cp.name }};
 {% endfor %}
 
+{%- if output_chunks_flat and output_chunks_flat|length > 0 and output_chunks_flat[0].port_hi is defined %}
+    // Bin-packing mode: partial bit-range assignments
+{% for i in range(output_count) %}
+    assign out_buf[{{ i }}] = {WIDTH{1'b0}};
+{% endfor %}
+{% for c in output_chunks_flat %}
+    assign out_buf[{{ c.bram_idx }}][{{ c.bram_hi }}:{{ c.bram_lo }}] = user_out_w_{{ c.port_name }}[{{ c.port_hi }}:{{ c.port_lo }}];
+{% endfor %}
+{%- else %}
 {% for p in output_chunked %}
 {% for c in p.chunks %}
 {% set pad = WIDTH - (c.hi - c.lo + 1) %}
@@ -230,6 +243,7 @@ module {{ wrapper_module }} #(
 {% endif %}
 {% endfor %}
 {% endfor %}
+{% endif %}
 
     reg               user_start_wire;
     wire              user_done_wire;
