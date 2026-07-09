@@ -37,7 +37,8 @@ IP-Generator/
 │   ├── stream_sipo.j2
 │   ├── stream_piso.j2
 │   ├── stream_wrapper.j2
-│   └── stream_top.j2
+│   ├── stream_top.j2
+│   └── stream_bridge_ps2.j2   # PS/2 bridge: SIPO drop-in for --input-source adapter
 │
 ├── ip_generator.spec       # PyInstaller spec for ip_generator.exe
 └── img2mif.spec            # PyInstaller spec for img2mif.exe

@@ -27,6 +27,33 @@ import bram_generator
 
 
 # =============================================================================
+#  Constants
+# =============================================================================
+
+# Trigger key name → key_state bit index (matches device_adapter_ps2.v).
+# Only keys actually mapped to a dedicated bit are allowed; space (0x29)
+# is NOT in the adapter mapping table (falls into the default bucket 63).
+TRIGGER_BIT = {
+    'enter': 40,
+    'esc':   0,
+    'tab':   27,
+}
+VALID_TRIGGER_KEYS = list(TRIGGER_BIT.keys()) + [k.upper() for k in TRIGGER_BIT]
+VALID_INPUT_SOURCES = ('rabbit', 'adapter')
+
+# Default handshake port-name aliases. Used when no --handshake-config file
+# is passed and no per-role --*-ports CLI flags are given. Override either
+# wholesale (config file) or per role (CLI flags).
+DEFAULT_HANDSHAKE_PORTS = {
+    'clock': ['clk', 'clock', 'ap_clk'],
+    'reset': ['rst_n', 'rst', 'reset_n', 'reset', 'ap_rst', 'ap_rst_n'],
+    'start': ['start', 'go', 'begin', 'trigger', 'ap_start'],
+    'done':  ['done', 'valid', 'finish', 'complete', 'ap_done'],
+    'busy':  ['busy', 'ready', 'ap_ready', 'ap_idle'],
+}
+
+
+# =============================================================================
 #  Verilog parser (hand-rolled, no external Verilog library)
 # =============================================================================
 
@@ -200,11 +227,15 @@ def _parse_ports(port_list: str) -> List[Port]:
     For 2D array ports like `input wire [15:0] A [0:3][0:3]`, the
     total port bit-width is `bit_width × dim0 × dim1`.  The `width`
     field in Port stores the *bit* width (per element × total elements).
+
+    For Verilog-1995 non-ANSI port lists (e.g. Vitis HLS output) where
+    the module header is `module foo (a, b, c);` followed later by
+    `input [31:0] a; input b; output [3:0] c;`, no chunk has a leading
+    direction keyword.  We return Port(name=...) with direction='unknown'
+    in that case and the caller is expected to fill it in from the
+    module-body declarations.
     """
     ports: List[Port] = []
-    # First split on top-level commas to identify "header" chunks (those
-    # starting with a direction keyword) vs "tail" chunks (just a name
-    # continuing the previous header).
     chunks = _split_top_level_commas(port_list)
     current_dir: Optional[str] = None
     current_width: int = 1
@@ -214,27 +245,26 @@ def _parse_ports(port_list: str) -> List[Port]:
     for chunk in chunks:
         m = _PORT_DECL.search(chunk)
         if m:
-            # New header chunk: dir + optional range + optional array dims
             current_dir = m.group('dir')
             hi, lo = m.group('hi'), m.group('lo')
             bit_width, bit_used_param = (
                 _parse_width_from_range(hi, lo) if hi and lo else (1, False)
             )
             array_total, array_used_param = _parse_array_dims(m.group('array_dims') or '')
-            # Total port bit width = bit_width per element * array elements
             current_width = bit_width * array_total
             current_used_param = bit_used_param or array_used_param
             current_array_count = array_total
             current_signed = 'signed' in chunk
             name = m.group('name')
         else:
-            # Tail chunk: just a port name (continuation of previous header)
-            if current_dir is None:
-                continue
             m2 = re.search(r'\b(\w+)\s*$', chunk.strip())
             if not m2:
                 continue
             name = m2.group(1)
+            if current_dir is None:
+                # Non-ANSI: keep the name, mark direction as unknown.
+                ports.append(Port(name=name, direction='unknown'))
+                continue
         ports.append(Port(
             name=name,
             direction=current_dir,
@@ -244,6 +274,43 @@ def _parse_ports(port_list: str) -> List[Port]:
             array_count=current_array_count,
         ))
     return ports
+
+
+def _find_module_end(src: str, start: int) -> int:
+    """Return the index just past `endmodule` for the module whose header
+    ends at or after `start`. Falls back to end-of-source if `endmodule`
+    isn't found.
+    """
+    m = re.search(r'\bendmodule\b', src[start:])
+    return start + m.end() if m else len(src)
+
+
+# Match a Verilog-1995 port declaration: `input [W-1:0] NAME;` or `output NAME;`
+# Use \s* (not \s+) around the optional keyword group so trailing spaces are
+# not consumed away from the [hi:lo] range that follows.
+_DECL_LINE = re.compile(
+    r'\b(?P<dir>input|output|inout)\b\s*'
+    r'(?:(?:wire|reg|logic|signed|unsigned)\s+)*'
+    r'(?:\[(?P<hi>[^\]]*?)\s*:\s*(?P<lo>[^\]]*?)\])?\s*'
+    r'(?P<name>\w+)'
+    r'\s*[,;]'
+)
+
+
+def _scan_declared_ports(body: str) -> Dict[str, Tuple[str, int, bool, bool]]:
+    """Scan a Verilog-1995 port-declaration block. Returns
+    `name -> (direction, width, signed, used_parameter)`.
+
+    Used to recover port metadata from HLS-generated non-ANSI files.
+    """
+    out: Dict[str, Tuple[str, int, bool, bool]] = {}
+    for m in _DECL_LINE.finditer(body):
+        d = m.group('dir')
+        hi, lo = m.group('hi'), m.group('lo')
+        w, up = _parse_width_from_range(hi, lo) if hi and lo else (1, False)
+        signed = bool(re.search(r'\b(signed)\b', body[max(0, m.start()-20):m.end()]))
+        out[m.group('name')] = (d, w, signed, up)
+    return out
 
 
 def _parse_params(param_list: str) -> List[Tuple[str, str]]:
@@ -256,8 +323,14 @@ def _parse_params(param_list: str) -> List[Tuple[str, str]]:
     return out
 
 
-def parse_modules(path: str) -> Dict[str, Any]:
-    """Parse a Verilog file and return a dict of module name → ModuleInfo."""
+def parse_modules(path: str, handshake_ports: Optional[Dict[str, List[str]]] = None) -> Dict[str, Any]:
+    """Parse a Verilog file and return a dict of module name → ModuleInfo.
+
+    `handshake_ports` is a role→port-names map (e.g. {'clock': ['clk','ap_clk'], ...}).
+    Currently informational — the parser does not classify ports, but the
+    argument is reserved for forward compatibility (e.g. annotating which
+    ports are clock/reset so downstream tools can mark them).
+    """
 
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -272,6 +345,21 @@ def parse_modules(path: str) -> Dict[str, Any]:
         params_raw = m.group('params') or ''
         mod.parameters = _parse_params(params_raw)
         mod.ports = _parse_ports(m.group('ports'))
+        # Verilog-1995 non-ANSI port lists contain only names; directions and
+        # widths are declared later in `input NAME;` / `output [W-1:0] NAME;`
+        # form (Vitis HLS uses this style). If _parse_ports couldn't resolve
+        # any direction, scan the body for those declarations and fill them in.
+        if mod.ports and all(p.direction == 'unknown' for p in mod.ports):
+            body_end = _find_module_end(stripped, m.end())
+            decls = _scan_declared_ports(stripped[m.end():body_end])
+            for p in mod.ports:
+                if p.name in decls:
+                    d, w, s, up = decls[p.name]
+                    p.direction = d
+                    if w != 1:
+                        p.width = w
+                    p.signed = s
+                    p.used_parameter = up
         modules.append(mod)
 
     return {
@@ -286,13 +374,21 @@ def parse_modules(path: str) -> Dict[str, Any]:
 #  Generator
 # =============================================================================
 
-def _validate_bram(width: int, depth: int) -> Optional[str]:
-    """Return an error message if (width, depth) is not supported, else None."""
-    if (width, depth) not in bram_generator._VALID_COMBINATIONS:
-        valid = sorted(bram_generator._VALID_COMBINATIONS)
+def _validate_bram(width: int, depth: int, bram_type: str = "ram4s") -> Optional[str]:
+    """Return an error message if (width, depth) is not supported for the
+    given BRAM primitive family, else None.
+    """
+    if bram_type not in bram_generator.BRAM_TYPES:
+        return f"Unknown BRAM type: {bram_type}. Valid: {list(bram_generator.BRAM_TYPES.keys())}"
+    valid = bram_generator.BRAM_TYPES[bram_type]["valid_combinations"]
+    if valid is None:
+        return None   # generic accepts any
+    if (width, depth) not in valid:
+        sorted_valid = sorted(valid)
         return (
-            f"BRAM ({width} x {depth}) is not a supported combination. "
-            f"See BRAM IP docs for the list of valid (width, depth) pairs."
+            f"BRAM ({width} x {depth}) is not a supported combination for "
+            f"bram_type={bram_type}. See BRAM IP docs for the list of "
+            f"valid (width, depth) pairs."
         )
     return None
 
@@ -321,6 +417,35 @@ def _port_connection(port: Port, width: int) -> str:
     return "1'b0"
 
 
+def _compute_chunks(data_ports: List[Dict], bram_width: int) -> Tuple[List[Dict], int]:
+    """Break heterogeneous-width data ports into BRAM-width chunks.
+
+    Each data port is a dict with keys: name, width, array_count.
+    Returns (chunked_ports, total_chunks) where chunked_ports is:
+        [{name, width, array_count, chunks: [{bram_idx, hi, lo}]}, ...]
+    and total_chunks is the INPUT_COUNT or OUTPUT_COUNT.
+    """
+    chunked: List[Dict] = []
+    bram_idx = 0
+    for p in data_ports:
+        pw = p['width']
+        ac = p.get('array_count', 1)
+        n_chunks = max(1, (pw + bram_width - 1) // bram_width)
+        port_chunks = []
+        for c in range(n_chunks):
+            lo = c * bram_width
+            hi = min(pw, (c + 1) * bram_width) - 1
+            port_chunks.append({'bram_idx': bram_idx, 'hi': hi, 'lo': lo})
+            bram_idx += 1
+        chunked.append({
+            'name': p['name'],
+            'width': pw,
+            'array_count': ac,
+            'chunks': port_chunks,
+        })
+    return chunked, bram_idx
+
+
 def generate_stream_ip(
     source_file: str,
     top_module: str,
@@ -332,18 +457,91 @@ def generate_stream_ip(
     include_sipo: bool = True,
     include_piso: bool = True,
     debug: bool = False,
-    width: int = 0,          # 0 = auto-detect, >0 = override
+    width: int = 0,
+    control_inputs: Optional[List[str]] = None,
+    control_outputs: Optional[List[str]] = None,
+    pingpong: bool = False,
+    bram_type: str = "ram4s",
+    adapters: Optional[List[Dict[str, Any]]] = None,
+    input_source: str = 'rabbit',
+    trigger_key: str = 'enter',
+    numeric_width: int = 32,
+    handshake_ports: Optional[Dict[str, List[str]]] = None,
+    sync_mode: bool = False,
 ) -> Dict[str, Any]:
-    """Generate the five .v files for the stream wrapper.
+    """Generate stream wrapper Verilog files for a user module.
 
-    Returns the standard {success, message, ...} dict. On success, also
-    includes 'wrapper_file', 'top_file', 'bram_file', and 'files'.
+    Port classification (priority order):
+      1. clk / rst_n           → clock/reset
+      2. start / done / busy   → handshake (auto-detected by name)
+      3. --control-inputs/--control-outputs → exposed on wrapper top-level
+      4. everything else       → data port (serialized through BRAM)
 
-    If width=0, the data port width is auto-detected from the first
-    non-handshake data port in the user module.
+    Heterogeneous widths are now supported: each data port can have a
+    different bit width.  Ports wider than bram_width span multiple BRAM
+    entries; ports narrower use 1 entry (high bits zeroed on input,
+    masked on output).
+
+    If pingpong=True, generates a double-buffered wrapper with 4 BRAM
+    instances and a pipelined FSM.
+
+    If input_source='adapter', the SIPO block is replaced with a
+    "bridge" module that listens to a PS/2 adapter trigger key
+    (e.g. Enter) rising edge and pulses src_done for 1 cycle.  The
+    FSM is otherwise identical — the bridge is a drop-in replacement
+    for SIPO.  Requires adapters to include a 'ps2' binding with
+    key_state output.
     """
 
-    # Parse the user's Verilog
+    # ── Resolve input_source / trigger_key syntax ────────────────────
+    input_source_norm = (input_source or 'rabbit').lower()
+    if input_source_norm not in VALID_INPUT_SOURCES:
+        return {
+            'success': False,
+            'error': f"Unknown --input-source '{input_source}'. "
+                     f"Valid: {list(VALID_INPUT_SOURCES)}",
+            'message': 'Unknown --input-source',
+        }
+
+    trigger_key_norm = (trigger_key or 'enter').lower()
+    if input_source_norm == 'adapter':
+        if trigger_key_norm not in TRIGGER_BIT:
+            return {
+                'success': False,
+                'error': f"Unknown --trigger-key '{trigger_key}'. "
+                         f"Valid: {list(TRIGGER_BIT.keys())}",
+                'message': 'Unknown --trigger-key',
+            }
+        if pingpong:
+            return {
+                'success': False,
+                'error': "--input-source adapter is incompatible with --pingpong",
+                'message': 'Bridge mode requires single-buffer wrapper',
+            }
+        if not include_sipo:
+            return {
+                'success': False,
+                'error': "--input-source adapter is incompatible with --no-sipo. "
+                         "Use adapter mode (which inherently skips SIPO) or "
+                         "remove the --no-sipo flag.",
+                'message': 'Adapter mode already replaces SIPO',
+            }
+        # Adapter mode requires an event-mode adapter binding.  Any
+        # of ps2 / uart / gpio produces a 1-cycle src_done pulse via
+        # the bridge module.
+        valid_event_adapters = {'ps2', 'uart', 'gpio'}
+        has_event_adapter = any(
+            ad.get('name') in valid_event_adapters for ad in (adapters or [])
+        )
+        if not has_event_adapter:
+            return {
+                'success': False,
+                'error': "--input-source adapter requires --adapter "
+                         "ps2:.../uart:.../gpio:...",
+                'message': 'Missing event-mode adapter for bridge',
+            }
+
+    # ── Parse user Verilog ────────────────────────────────────────────
     parsed = parse_modules(source_file)
     if not parsed.get('success'):
         return parsed
@@ -360,38 +558,146 @@ def generate_stream_ip(
                   used_parameter=p['used_parameter'],
                   array_count=p.get('array_count', 1)) for p in mod_dict['ports']]
 
-    # Auto-detect port width from first data port (skip handshake ports)
-    if width <= 0:
-        handshake = {'clk', 'clock', 'rst_n', 'rst', 'reset', 'start', 'done', 'busy'}
-        in_ports = [p for p in ports if p.direction == 'input'
-                    and p.name.lower() not in handshake and p.width > 1]
-        out_ports = [p for p in ports if p.direction == 'output'
-                     and p.name.lower() not in handshake and p.width > 1]
-        if in_ports:
-            width = in_ports[0].width
-        elif out_ports:
-            width = out_ports[0].width
-        if width <= 0:
-            return {'success': False, 'error': 'Cannot auto-detect port width; use --width',
-                    'message': 'Width detection failed'}
+    if control_inputs is None:
+        control_inputs = []
+    if control_outputs is None:
+        control_outputs = []
 
-    if width != bram_width:
-        return {'success': False,
-                'error': f'Port width ({width}) != BRAM width ({bram_width})',
-                'message': 'Width/BRAM mismatch'}
+    if adapters is None:
+        adapters = []
 
-    # BRAM validation
-    err = _validate_bram(bram_width, bram_depth)
+    ctrl_in_set  = set(control_inputs)
+    ctrl_out_set = set(control_outputs)
+
+    # Build set of port names claimed by adapters (these are routed
+    # straight from adapter outputs to user module, bypassing SIPO/BRAM).
+    adapter_claimed_ports: Dict[str, Dict[str, Any]] = {}
+    for ad in adapters:
+        for pname in ad.get('ports', []):
+            adapter_claimed_ports[pname] = ad
+
+    # ── BRAM validation ───────────────────────────────────────────────
+    err = _validate_bram(bram_width, bram_depth, bram_type)
     if err:
         return {'success': False, 'error': err, 'message': err}
 
-    # Generate the BRAM IP via the existing bram_generator API
+    # ── BRAM depth check (adapter mode) ───────────────────────────────
+    if input_source_norm == 'adapter':
+        bram_depth_min = (numeric_width + bram_width - 1) // bram_width
+        if bram_depth < bram_depth_min:
+            return {
+                'success': False,
+                'error': (f"--bram-depth ({bram_depth}) is too small for "
+                          f"--numeric-width ({numeric_width}) at WIDTH={bram_width}. "
+                          f"Need at least ceil({numeric_width}/{bram_width}) = "
+                          f"{bram_depth_min}."),
+                'message': 'BRAM depth insufficient for numeric_width',
+            }
+
+    # ── Port classification ──────────────────────────────────────────
+    addr_w = _addr_w(bram_depth)
+    # Resolve handshake port-name aliases: defaults < file < CLI overrides.
+    # Caller has already merged these; missing keys fall back to defaults.
+    hp = {**DEFAULT_HANDSHAKE_PORTS, **(handshake_ports or {})}
+    clock_names = set(hp.get('clock', []))
+    reset_names = set(hp.get('reset', []))
+    start_names = set(hp.get('start', []))
+    done_names  = set(hp.get('done',  []))
+    busy_names  = set(hp.get('busy',  []))
+
+    start_port = None
+    done_port = None
+    busy_port = None
+    clock_port = None
+    reset_port = None
+    has_busy_port = False
+
+    # Vectors for template rendering
+    control_input_ports = []   # exposed on wrapper top-level
+    control_output_ports = []  # exposed on wrapper top-level
+    data_input_ports = []      # serialized through SIPO→BRAM
+    data_output_ports = []     # serialized through BRAM→PISO
+    adapter_input_ports: Dict[str, List[Dict[str, Any]]] = {}  # per-adapter port lists
+
+    for p in ports:
+        lname = p.name.lower()
+        if p.direction == 'input':
+            if lname in clock_names:
+                clock_port = p.name
+                continue
+            elif lname in reset_names:
+                reset_port = p.name
+                continue
+            elif lname in start_names:
+                start_port = p.name
+            elif p.name in ctrl_in_set:
+                control_input_ports.append({
+                    'name': p.name, 'width': p.width, 'signed': p.signed,
+                })
+            elif p.name in adapter_claimed_ports:
+                ad = adapter_claimed_ports[p.name]
+                adapter_input_ports.setdefault(ad['name'], []).append({
+                    'name': p.name, 'width': p.width, 'signed': p.signed,
+                })
+            else:
+                data_input_ports.append({
+                    'name': p.name, 'width': p.width,
+                    'array_count': p.array_count, 'signed': p.signed,
+                })
+        elif p.direction == 'output':
+            if lname in done_names:
+                done_port = p.name
+            elif lname in busy_names:
+                busy_port = p.name
+                has_busy_port = True
+            elif p.name in ctrl_out_set:
+                control_output_ports.append({
+                    'name': p.name, 'width': p.width, 'signed': p.signed,
+                })
+            else:
+                data_output_ports.append({
+                    'name': p.name, 'width': p.width,
+                    'array_count': p.array_count, 'signed': p.signed,
+                })
+
+    user_has_handshake = start_port is not None and done_port is not None
+
+    # Adapter mode override: force input_count = 0 (no Rabbit-fed BRAM
+    # entries), so the existing `input_count == 0` path in the wrapper
+    # FSM is used (pass-through-like: no C_LAUNCH, start pulses directly).
+    if input_source_norm == 'adapter':
+        if not user_has_handshake:
+            return {
+                'success': False,
+                'error': "--input-source adapter requires the user module "
+                         "to have both 'start' (input) and 'done' (output) "
+                         "handshake ports (auto-detected by name).  Bridge "
+                         "mode drives user.start/done via the C_COMPUTING FSM "
+                         "state, which is only entered via handshake.",
+                'message': 'Adapter mode requires user handshake',
+            }
+        data_input_ports = []   # ignore any data_input_ports — bridge supplies
+
+    # ── Compute heterogeneous chunks ──────────────────────────────────
+    input_chunked, input_count = _compute_chunks(data_input_ports, bram_width)
+    output_chunked, output_count = _compute_chunks(data_output_ports, bram_width)
+
+    # ── Index widths ──────────────────────────────────────────────────
+    def _idx_w(n: int) -> int:
+        if n <= 1:
+            return 1
+        return max(1, int(math.ceil(math.log2(n + 1))))
+    input_count_idx_w  = _idx_w(input_count)  if user_has_handshake else 1
+    output_count_idx_w = _idx_w(output_count) if user_has_handshake else 1
+
+    # ── Generate BRAM IP ──────────────────────────────────────────────
     bram_name = f"{top_module}__stream_bram"
     bram_result = bram_generator.generate_bram_ip(
         module_name=bram_name,
         width_A=bram_width, depth_A=bram_depth,
         width_B=bram_width, depth_B=bram_depth,
         raw_data_array=[0] * bram_depth,
+        bram_type=bram_type,
     )
     if not bram_result.get('success'):
         return {
@@ -400,153 +706,12 @@ def generate_stream_ip(
             'message': 'BRAM generation failed',
         }
 
-    # Build the wrapper template context.
-    # For each user port, classify it:
-    #   - clk / rst_n → top-level clock/reset
-    #   - start / done / busy (when present) → handshake
-    #   - all other inputs → tie to 0
-    #   - all other outputs → leave dangling
-    addr_w = _addr_w(bram_depth)
-    clock_names = {'clk', 'clock'}
-    reset_names = {'rst_n', 'rst', 'reset_n', 'reset'}
-    start_names = {'start', 'go', 'begin', 'trigger'}
-    done_names  = {'done', 'valid', 'finish', 'complete'}
-    busy_names  = {'busy', 'ready'}
+    # ── Template contexts ─────────────────────────────────────────────
+    gen_date = datetime.now().strftime('%Y.%m.%d')
 
-    user_input_ports = []   # all input ports that the wrapper must wire
-    user_output_ports = []  # all output ports that the wrapper must wire
-    user_input_data_ports = []   # inputs OTHER than clk/rst_n/start, in port-list order
-    user_output_data_ports = []  # outputs OTHER than done/busy, in port-list order
-
-    start_port = None
-    done_port = None
-    busy_port = None
-    has_busy_port = False
-
-    for p in ports:
-        lname = p.name.lower()
-        if p.direction == 'input':
-            if lname in clock_names:
-                user_input_ports.append({
-                    'name': p.name, 'width': p.width,
-                    'connection': 'clk', 'is_clock': True,
-                })
-            elif lname in reset_names:
-                user_input_ports.append({
-                    'name': p.name, 'width': p.width,
-                    'connection': 'rst_n', 'is_reset': True,
-                })
-            elif lname in start_names:
-                start_port = p.name
-            else:
-                user_input_ports.append({
-                    'name': p.name, 'width': p.width,
-                    'connection': _port_connection(p, p.width),
-                })
-                user_input_data_ports.append({'name': p.name, 'width': p.width})
-        elif p.direction == 'output':
-            if lname in done_names:
-                done_port = p.name
-            elif lname in busy_names:
-                busy_port = p.name
-                has_busy_port = True
-            else:
-                user_output_ports.append({
-                    'name': p.name, 'width': p.width,
-                    'connection': '', 'lint_off': True,
-                })
-                user_output_data_ports.append({'name': p.name, 'width': p.width})
-
-    # Handshake detection
-    user_has_handshake = start_port is not None and done_port is not None
-    if user_has_handshake:
-        # For handshake mode, each data port has `array_count` elements
-        # of `bram_width` bits each.  The wrapper's INPUT_COUNT and
-        # OUTPUT_COUNT are the *total number of elements* across all
-        # data ports of the user module.
-        for p in user_input_data_ports:
-            if p['width'] != bram_width:
-                return {
-                    'success': False,
-                    'error': f"User input port '{p['name']}' is {p['width']} bits but BRAM is {bram_width} bits",
-                    'message': 'Port width mismatch',
-                }
-        for p in user_output_data_ports:
-            if p['width'] != bram_width:
-                return {
-                    'success': False,
-                    'error': f"User output port '{p['name']}' is {p['width']} bits but BRAM is {bram_width} bits",
-                    'message': 'Port width mismatch',
-                }
-
-    # Compute total element counts across all data ports of each direction.
-    # For matrix_mult_4x4, A[0:3][0:3]=16 + B[0:3][0:3]=16 → 32 inputs.
-    def _port_total_elements(p) -> int:
-        # p is a port-dict {'name', 'width', 'array_count'}; the
-        # original Port object's array_count is what we need.
-        return p.get('array_count', 1)
-
-    # Re-iterate to populate array_count on the data-port dicts (since
-    # the input parsing kept it on the Port object).
-    for i, p in enumerate(user_input_data_ports):
-        for orig in ports:
-            if orig.name == p['name']:
-                user_input_data_ports[i]['array_count'] = orig.array_count
-                break
-    for i, p in enumerate(user_output_data_ports):
-        for orig in ports:
-            if orig.name == p['name']:
-                user_output_data_ports[i]['array_count'] = orig.array_count
-                break
-
-    input_count  = sum(_port_total_elements(p) for p in user_input_data_ports)  if user_has_handshake else 0
-    output_count = sum(_port_total_elements(p) for p in user_output_data_ports) if user_has_handshake else 0
-
-    # Build flat ordered port-name lists with their target index in
-    # user_in_reg[] / user_out_wire[].  For matrix_mult_4x4, the
-    # input data ports A[0:3][0:3] (16 elements) and B[0:3][0:3]
-    # (16 elements) flatten to A0..A15, B0..B15 in row-major order.
-    # For scalar ports, each name maps to one element.
-    user_input_data_port_names = []   # [{'name', 'index'}]
-    user_output_data_port_names = []  # [{'name', 'index'}]
-    user_input_data_port_names_grouped = []   # [{'name','index','array_count'}]
-    user_output_data_port_names_grouped = []  # [{'name','index','array_count'}]
-    if user_has_handshake:
-        idx = 0
-        for p in user_input_data_ports:
-            ac = p.get('array_count', 1)
-            user_input_data_port_names.append({'name': p['name'], 'index': idx})
-            user_input_data_port_names_grouped.append({
-                'name': p['name'], 'index': idx, 'array_count': ac,
-            })
-            idx += ac
-        idx = 0
-        for p in user_output_data_ports:
-            ac = p.get('array_count', 1)
-            user_output_data_port_names.append({'name': p['name'], 'index': idx})
-            user_output_data_port_names_grouped.append({
-                'name': p['name'], 'index': idx, 'array_count': ac,
-            })
-            idx += ac
-
-    # Index widths (ceil(log2(n+1))) for launch/dump counters.
-    # We use n+1 so the counter can also equal n+1 (e.g. dump_idx==OUTPUT_COUNT).
-    def _idx_w(n: int) -> int:
-        if n <= 1:
-            return 1
-        return max(1, int(math.ceil(math.log2(n + 1))))
-    input_count_idx_w  = _idx_w(input_count)  if user_has_handshake else 1
-    output_count_idx_w = _idx_w(output_count) if user_has_handshake else 1
-
-    # PISO result count: in handshake mode, it's output_count; in
-    # pass-through, it tracks sipo_cnt (data words received from Rabbit).
-    piso_result_count = (
-        f'8\'d{output_count}' if user_has_handshake else 'sipo_cnt[7:0]'
-    )
-
-    wrapper_ctx: Dict[str, Any] = {
+    # Shared context for both normal and pingpong wrappers
+    shared_ctx = {
         'top_module': top_module,
-        'wrapper_module': f"{top_module}__stream_wrapper",
         'bram_module': bram_name,
         'user_source': os.path.basename(source_file),
         'width': bram_width,
@@ -555,40 +720,95 @@ def generate_stream_ip(
         'addr_w': addr_w,
         'baud_div': baud_div,
         'idle_timeout': idle_timeout,
-        'user_input_ports': user_input_ports,
-        'user_output_ports': user_output_ports,
         'user_has_handshake': user_has_handshake,
-        'user_input_data_ports': user_input_data_ports,
-        'user_output_data_ports': user_output_data_ports,
-        'user_input_data_port_names': user_input_data_port_names,
-        'user_output_data_port_names': user_output_data_port_names,
-        'user_input_data_port_names_grouped': user_input_data_port_names_grouped,
-        'user_output_data_port_names_grouped': user_output_data_port_names_grouped,
+        'control_input_ports': control_input_ports,
+        'control_output_ports': control_output_ports,
+        'has_control_ports': bool(control_input_ports or control_output_ports),
+        'data_input_ports': data_input_ports,
+        'data_output_ports': data_output_ports,
+        'input_chunked': input_chunked,
+        'output_chunked': output_chunked,
         'start_port': start_port or 'start',
         'done_port': done_port or 'done',
         'busy_port': busy_port or 'busy',
+        # When the user module actually has a clock/reset port we use the
+        # detected name; otherwise we leave it as None so the wrapper
+        # template can skip emitting the corresponding .clk/.rst_n line.
+        'clock_port': clock_port,
+        'reset_port': reset_port,
+        'has_clock_port': clock_port is not None,
+        'has_reset_port': reset_port is not None,
         'has_busy_port': has_busy_port,
         'input_count': input_count,
         'output_count': output_count,
         'input_count_idx_w': input_count_idx_w,
         'output_count_idx_w': output_count_idx_w,
-        'piso_result_count': piso_result_count,
-        'generation_date': datetime.now().strftime('%Y.%m.%d'),
+        'generation_date': gen_date,
         'debug': debug,
+        'input_source': input_source_norm,
+        'sync_mode': sync_mode,
+        'trigger_key': trigger_key_norm,
+        'trigger_bit': TRIGGER_BIT.get(trigger_key_norm, 40) if input_source_norm == 'adapter' else 0,
+        'numeric_width': numeric_width,
     }
+
+    wrapper_ctx = dict(shared_ctx)
+    wrapper_ctx['wrapper_module'] = f"{top_module}__stream_wrapper"
+    wrapper_ctx['adapters'] = adapters
+    wrapper_ctx['adapter_input_ports'] = adapter_input_ports
 
     top_ctx: Dict[str, Any] = {
         'top_module': top_module,
         'stream_module': f"{top_module}__stream_wrapper",
-        'generation_date': wrapper_ctx['generation_date'],
+        'generation_date': gen_date,
         'width':  bram_width,
         'WIDTH':  bram_width,
         'depth':  bram_depth,
         'debug': debug,
+        'input_count': input_count,
+        'output_count': output_count,
+        'control_input_ports': control_input_ports,
+        'control_output_ports': control_output_ports,
+        'has_control_ports': bool(control_input_ports or control_output_ports),
+        'adapters': adapters,
     }
 
-    # Render and write
+    src_ctx = {
+        'top_module': top_module,
+        'generation_date': gen_date,
+        'width':  bram_width,
+        'count':  input_count,
+        'addr_w': addr_w,
+        # Async FIFO depth: default 8 entries (FIFO_ADDR_W=3).  This
+        # gives ~8 byte buffer between the s_clk_in producer and the
+        # system-clock consumer — more than enough for the 115200-baud
+        # Rabbit case, while costing only ~16 FFs.
+        'fifo_addr_w': 3,
+    }
+    piso_ctx = {
+        'top_module': top_module,
+        'generation_date': gen_date,
+        'width':    bram_width,
+        'count':    output_count,
+        'baud_div': baud_div,
+        'addr_w':   addr_w,
+    }
 
+    # Bridge template context: only used when input_source='adapter'.
+    # USE_TRIGGER_BIT selects PS/2 mode (key_state[TRIGGER_BIT] rising edge)
+    # vs. generic event mode (1-bit `event_in` pulse from UART/GPIO).
+    has_ps2 = any(ad['name'] == 'ps2' for ad in adapters)
+    bridge_ctx = {
+        'top_module':      top_module,
+        'generation_date': gen_date,
+        'addr_w':          addr_w,
+        'width':           bram_width,
+        'trigger_bit':     TRIGGER_BIT[trigger_key_norm],
+        'trigger_key':     trigger_key_norm,
+        'use_trigger_bit': 1 if has_ps2 else 0,
+    }
+
+    # ── Write files ───────────────────────────────────────────────────
     try:
         os.makedirs(out_dir, exist_ok=True)
     except OSError as e:
@@ -597,54 +817,99 @@ def generate_stream_ip(
     template_dir = os.path.dirname(os.path.abspath(__file__))
 
     bram_path = os.path.join(out_dir, f"{bram_name}.v")
-    wrapper_path = os.path.join(out_dir, f"{top_module}__stream_wrapper.v")
-    top_path = os.path.join(out_dir, f"{top_module}__stream_top.v")
-    sipo_path = os.path.join(out_dir, f"{top_module}__stream_sipo.v")
+    src_path = os.path.join(out_dir, f"{top_module}__stream_sipo.v")
+    bridge_path = os.path.join(out_dir, f"{top_module}__stream_bridge.v")
     piso_path = os.path.join(out_dir, f"{top_module}__stream_piso.v")
 
-    sipo_ctx = {
-        'top_module': top_module,
-        "generation_date": wrapper_ctx["generation_date"],
-        "width":  bram_width,
-        "count":  input_count,
-        "addr_w": addr_w,
-    }
-    piso_ctx = {
-        'top_module': top_module,
-        "generation_date": wrapper_ctx["generation_date"],
-        "width":    bram_width,
-        "count":    output_count,
-        "baud_div": baud_div,
-        "addr_w":   addr_w,
-    }
+    if pingpong:
+        wrapper_path = os.path.join(out_dir, f"{top_module}__stream_wrapper.v")
+        top_path     = os.path.join(out_dir, f"{top_module}__stream_top.v")
+        wrapper_tmpl = 'stream_wrapper_pingpong.j2'
+        top_tmpl     = 'stream_top_pingpong.j2'
+    else:
+        wrapper_path = os.path.join(out_dir, f"{top_module}__stream_wrapper.v")
+        top_path     = os.path.join(out_dir, f"{top_module}__stream_top.v")
+        wrapper_tmpl = 'stream_wrapper.j2'
+        top_tmpl     = 'stream_top.j2'
+
+    # Copy required adapter Verilog files into out_dir
+    ADAPTERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'adapters')
+    for ad in adapters:
+        ad_name = ad['name']
+        adapter_src_path = os.path.join(ADAPTERS_DIR, f"device_adapter_{ad_name}.v")
+        if os.path.isfile(adapter_src_path):
+            adapter_dst_path = os.path.join(out_dir, f"device_adapter_{ad_name}.v")
+            with open(adapter_src_path, 'r', encoding='utf-8') as fsrc, \
+                 open(adapter_dst_path, 'w', encoding='utf-8') as fdst:
+                fdst.write(fsrc.read())
+
+    # Copy the async FIFO primitive (used by stream_sipo.v) into out_dir.
+    # This is a hand-written Verilog module shared by all SIPO instances.
+    ASYNC_FIFO_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'templates', 'stream_async_fifo.v')
+    if os.path.isfile(ASYNC_FIFO_SRC):
+        async_fifo_dst = os.path.join(out_dir, 'stream_async_fifo.v')
+        with open(ASYNC_FIFO_SRC, 'r', encoding='utf-8') as fsrc, \
+             open(async_fifo_dst, 'w', encoding='utf-8') as fdst:
+            fdst.write(fsrc.read())
+
+    files_written = [bram_path, piso_path, wrapper_path, top_path,
+                     os.path.join(out_dir, 'stream_async_fifo.v')]
+    if input_source_norm == 'adapter':
+        # Bridge replaces SIPO.  We always keep the BRAM instance for
+        # sanity (the wrapper would never read it; it's an unused cost
+        # of ~1 BRAM tile, but it keeps the wrapper structurally identical
+        # to the regular path).  Actually for adapter mode we don't need
+        # an input BRAM at all — omit it via the `input_count > 0` guards
+        # in stream_wrapper.j2.
+        files_written.append(bridge_path)
+    else:
+        files_written.append(src_path)
+    for ad in adapters:
+        files_written.append(os.path.join(out_dir, f"device_adapter_{ad['name']}.v"))
 
     try:
         with open(bram_path, 'w', encoding='utf-8') as f:
             f.write(_ensure_trailing_newline(bram_result['verilog_code']))
-        with open(sipo_path, 'w', encoding='utf-8') as f:
-            f.write(_ensure_trailing_newline(_render(template_dir, 'stream_sipo.j2', sipo_ctx)))
+        if input_source_norm == 'adapter':
+            with open(bridge_path, 'w', encoding='utf-8') as f:
+                f.write(_ensure_trailing_newline(_render(template_dir, 'stream_bridge.j2', bridge_ctx)))
+        else:
+            with open(src_path, 'w', encoding='utf-8') as f:
+                f.write(_ensure_trailing_newline(_render(template_dir,
+            'stream_sipo_sync.j2' if sync_mode else 'stream_sipo.j2', src_ctx)))
         with open(piso_path, 'w', encoding='utf-8') as f:
-            f.write(_ensure_trailing_newline(_render(template_dir, 'stream_piso.j2', piso_ctx)))
+            f.write(_ensure_trailing_newline(_render(template_dir,
+            'stream_piso_sync.j2' if sync_mode else 'stream_piso.j2', piso_ctx)))
         with open(wrapper_path, 'w', encoding='utf-8') as f:
-            f.write(_ensure_trailing_newline(_render(template_dir, 'stream_wrapper.j2', wrapper_ctx)))
+            f.write(_ensure_trailing_newline(_render(template_dir, wrapper_tmpl, wrapper_ctx)))
         with open(top_path, 'w', encoding='utf-8') as f:
-            f.write(_ensure_trailing_newline(_render(template_dir, 'stream_top.j2', top_ctx)))
+            f.write(_ensure_trailing_newline(_render(template_dir, top_tmpl, top_ctx)))
     except OSError as e:
         return {'success': False, 'error': str(e), 'message': f'Cannot write to {out_dir}'}
 
-    return {
+    mode_str = "ping-pong" if pingpong else "standard"
+    mode_str += f" [input_source={input_source_norm}"
+    if input_source_norm == 'adapter':
+        mode_str += f", trigger_key={trigger_key_norm}, numeric_width={numeric_width}"
+    mode_str += "]"
+    result_dict = {
         'success': True,
         'wrapper_file': wrapper_path,
         'top_file': top_path,
         'bram_file': bram_path,
-        'sipo_file': sipo_path,
+        'src_file': src_path,
         'piso_file': piso_path,
-        'files': [bram_path, sipo_path, piso_path, wrapper_path, top_path],
+        'files': files_written,
         'message': (
-            f"Stream wrapper generated for {top_module} "
-            f"({bram_width}x{bram_depth} BRAM, width={width})"
+            f"Stream wrapper ({mode_str}) generated for {top_module} "
+            f"({bram_width}x{bram_depth} BRAM, input_count={input_count}, output_count={output_count})"
         ),
     }
+    if input_source_norm == 'adapter':
+        result_dict['bridge_file'] = bridge_path
+        result_dict['src_file'] = None
+    return result_dict
 
 
 # =============================================================================
@@ -661,10 +926,6 @@ def main(args_list: Optional[List[str]] = None) -> int:
                         help='Path to user Verilog source file')
     parser.add_argument('--top', '-t', default=None,
                         help='Top module name (required unless --print-modules)')
-    parser.add_argument('--input-port', default=None,
-                        help='Parallel input data port ("name" or "name:width")')
-    parser.add_argument('--output-port', default=None,
-                        help='Parallel output data port ("name" or "name:width")')
     parser.add_argument('--bram-width', type=int, default=None)
     parser.add_argument('--bram-depth', type=int, default=None)
     parser.add_argument('--out-dir', default='.')
@@ -673,15 +934,44 @@ def main(args_list: Optional[List[str]] = None) -> int:
     parser.add_argument('--no-sipo', action='store_true')
     parser.add_argument('--no-piso', action='store_true')
     parser.add_argument('--print-modules', action='store_true')
+    parser.add_argument('--debug', action='store_true',
+                        help='Include overflow/idle/busy debug status ports')
+    parser.add_argument('--control-inputs', default=None,
+                        help='Comma-separated control input port names to expose on wrapper')
+    parser.add_argument('--control-outputs', default=None,
+                        help='Comma-separated control output port names to expose on wrapper')
+    parser.add_argument('--pingpong', action='store_true',
+                        help='Generate double-buffered ping-pong wrapper with 4 BRAMs')
+    parser.add_argument('--bram-type', type=str, default='ram4s',
+                        choices=['ram4s', 'ram8b', 'ramb18e1', 'ramb36e1', 'generic'],
+                        help='BRAM primitive family (default: ram4s)')
+    parser.add_argument('--adapter', action='append', default=None,
+                        help='Physical device adapter binding. Format: '
+                             'TYPE:PORT[,PORT...] e.g. '
+                             '--adapter ps2:key_state[63:0],mod_state[7:0]. '
+                             'May be repeated for multiple adapters.')
+    parser.add_argument('--input-source', choices=list(VALID_INPUT_SOURCES),
+                        default='rabbit',
+                        help='Stream input source: "rabbit" (default 3-wire '
+                             'serial from host) or "adapter" (PS/2 keyboard '
+                             'via the bridge module; requires --adapter ps2).')
+    parser.add_argument('--trigger-key', choices=list(TRIGGER_BIT.keys()),
+                        default='enter',
+                        help='Which PS/2 key presses the bridge into '
+                             'computing (only used with --input-source '
+                             'adapter). Default: enter.')
+    parser.add_argument('--numeric-width', type=int, default=32,
+                        choices=[8, 16, 32, 64],
+                        help='Width of the numeric accumulator (only used '
+                             'with --input-source adapter for BRAM-depth '
+                             'validation). Default: 32.')
     args = parser.parse_args(args_list)
 
     if args.print_modules:
         result = parse_modules(args.source)
     else:
-        # Validate required args
         missing = [k for k, v in {
-            'top': args.top, 'input-port': args.input_port,
-            'output-port': args.output_port, 'bram-width': args.bram_width,
+            'top': args.top, 'bram-width': args.bram_width,
             'bram-depth': args.bram_depth,
         }.items() if v is None]
         if missing:
@@ -691,11 +981,22 @@ def main(args_list: Optional[List[str]] = None) -> int:
                 'message': 'Missing required arguments',
             }
         else:
+            ctrl_in = [x.strip() for x in args.control_inputs.split(',') if x.strip()] \
+                      if args.control_inputs else None
+            ctrl_out = [x.strip() for x in args.control_outputs.split(',') if x.strip()] \
+                       if args.control_outputs else None
+            # Parse --adapter flags: TYPE:port1[bits],port2[bits],...
+            adapters_list = []
+            if args.adapter:
+                for spec in args.adapter:
+                    if ':' not in spec:
+                        return 0  # fallthrough to argparse error
+                    atype, ports_str = spec.split(':', 1)
+                    port_names = [p.strip().split('[')[0] for p in ports_str.split(',') if p.strip()]
+                    adapters_list.append({'name': atype.strip(), 'ports': port_names})
             result = generate_stream_ip(
                 source_file=args.source,
                 top_module=args.top,
-                input_port=args.input_port,
-                output_port=args.output_port,
                 bram_width=args.bram_width,
                 bram_depth=args.bram_depth,
                 out_dir=args.out_dir,
@@ -703,6 +1004,15 @@ def main(args_list: Optional[List[str]] = None) -> int:
                 idle_timeout=args.idle_timeout,
                 include_sipo=not args.no_sipo,
                 include_piso=not args.no_piso,
+                debug=args.debug,
+                control_inputs=ctrl_in,
+                control_outputs=ctrl_out,
+                pingpong=args.pingpong,
+                bram_type=args.bram_type,
+                adapters=adapters_list,
+                input_source=args.input_source,
+                trigger_key=args.trigger_key,
+                numeric_width=args.numeric_width,
             )
 
     print(json.dumps(result, indent=2))

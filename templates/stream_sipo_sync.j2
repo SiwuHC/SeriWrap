@@ -1,0 +1,83 @@
+/*==============================================================
+ *  File: stream_sipo.v  (sync-mode — no async FIFO)
+ *  Author: UFDE+ IP Generator
+ *  Date: {{ generation_date }}
+ *==============================================================*/
+`timescale 1ns / 1ps
+
+
+/*
+ *  Sync-mode Serial-In-Parallel-Out.
+ *
+ *  Unlike the standard SIPO which uses a Gray-coded async FIFO for
+ *  cross-domain safety, the sync variant assumes `clk_in` == `clk`
+ *  and writes `data_in` directly into BRAM on cycles where
+ *  `strobe_in` is high.  This eliminates the ~100 LUT async-FIFO
+ *  overhead for designs that do not need clock-domain crossing.
+ *
+ *  Parameters:
+ *    WIDTH        - bit width of each parallel data word
+ *    COUNT        - number of words to receive before done
+ *    ADDR_W       - BRAM address bus width
+ *=============================================================*/
+
+module {{ top_module }}__stream_sipo #(
+    parameter WIDTH        = {{ width }},
+    parameter COUNT        = {{ count }},
+    parameter ADDR_W       = {{ addr_w }}
+) (
+    input  wire               clk,         // system clock
+    input  wire               rst_n,
+
+    // Parallel input  (sync — clk_in is the same as clk)
+    input  wire [WIDTH-1:0]  data_in,
+    input  wire               clk_in,       // unused, kept for port compatibility
+    input  wire               strobe_in,
+
+    // BRAM write interface (Port A)
+    output reg  [ADDR_W-1:0] bram_addr,
+    output reg  [WIDTH-1:0]  bram_din,
+    output reg                bram_we,
+
+    // Status
+    output reg  [ADDR_W-1:0]  write_count,
+    output reg                done,
+    output reg                overflow,
+
+    input  wire               batch_arm
+);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            bram_addr    <= 0;
+            bram_din     <= 0;
+            bram_we      <= 1'b0;
+            write_count  <= 0;
+            done         <= 1'b0;
+            overflow     <= 1'b0;
+        end else if (batch_arm) begin
+            bram_addr    <= 0;
+            bram_din     <= 0;
+            bram_we      <= 1'b0;
+            write_count  <= 0;
+            done         <= 1'b0;
+            overflow     <= 1'b0;
+        end else begin
+            bram_we  <= 1'b0;
+            done     <= 1'b0;
+            overflow <= 1'b0;
+
+            if (strobe_in && write_count < COUNT) begin
+                bram_we     <= 1'b1;
+                bram_din    <= data_in;
+                bram_addr   <= write_count;
+                write_count <= write_count + 1'b1;
+                if (write_count == COUNT - 1)
+                    done <= 1'b1;
+            end else if (write_count >= COUNT && strobe_in) begin
+                overflow <= 1'b1;
+            end
+        end
+    end
+
+endmodule

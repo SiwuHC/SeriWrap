@@ -37,7 +37,8 @@ import stream_generator
 
 
 def handle_bram(args) -> int:
-    result = bram_generator.generate_bram_from_mif(args.mif_file, args.output)
+    result = bram_generator.generate_bram_from_mif(args.mif_file, args.output,
+                                                   bram_type=args.bram_type)
     print(json.dumps(result))
     return 0 if result['success'] else 1
 
@@ -53,11 +54,48 @@ def handle_pll(args) -> int:
         return 0 if result['success'] else 1
 
 
+def _load_handshake_ports(args):
+    """Resolve handshake port-name aliases from defaults + file + CLI flags.
+
+    Priority (lowest to highest): built-in defaults < --handshake-config file <
+    per-role --*-ports CLI flags. Returns a dict of role → list[str].
+    """
+    import os
+    # 1. Built-in defaults ship with the package.
+    defaults = stream_generator.DEFAULT_HANDSHAKE_PORTS.copy()
+    # 2. Optional config file replaces the whole map.
+    if args.handshake_config:
+        path = args.handshake_config
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"--handshake-config not found: {path}")
+        with open(path) as f:
+            data = json.load(f)
+        for k in defaults.keys():
+            if k in data:
+                defaults[k] = list(data[k])
+    # 3. Per-role CLI flags override individual roles.
+    overrides = {
+        'clock': args.clock_ports,
+        'reset': args.reset_ports,
+        'start': args.start_ports,
+        'done':  args.done_ports,
+        'busy':  args.busy_ports,
+    }
+    for role, raw in overrides.items():
+        if raw is not None:
+            defaults[role] = [p.strip() for p in raw.split(',') if p.strip()]
+    return defaults
+
+
 def handle_stream(args) -> int:
     if args.print_modules:
-        result = stream_generator.parse_modules(args.source)
+        # Even --print-modules can use custom aliases (e.g. to inspect a
+        # Vitis-HLS file with ap_* ports).
+        result = stream_generator.parse_modules(
+            args.source,
+            handshake_ports=_load_handshake_ports(args),
+        )
     else:
-        # Validate required args for the generate path
         missing = [k for k, v in {
             'top': args.top, 'bram-width': args.bram_width,
             'bram-depth': args.bram_depth,
@@ -69,6 +107,21 @@ def handle_stream(args) -> int:
                 'message': 'Missing required arguments',
             }
         else:
+            ctrl_in = [x.strip() for x in args.control_inputs.split(',') if x.strip()] \
+                      if args.control_inputs else None
+            ctrl_out = [x.strip() for x in args.control_outputs.split(',') if x.strip()] \
+                       if args.control_outputs else None
+            adapters_list = []
+            if args.adapter:
+                for spec in args.adapter:
+                    if ':' not in spec:
+                        result = {'success': False, 'error': f"Bad --adapter spec: {spec}",
+                                  'message': 'Bad adapter spec'}
+                        print(json.dumps(result))
+                        return 1
+                    atype, ports_str = spec.split(':', 1)
+                    port_names = [p.strip().split('[')[0] for p in ports_str.split(',') if p.strip()]
+                    adapters_list.append({'name': atype.strip(), 'ports': port_names})
             result = stream_generator.generate_stream_ip(
                 source_file=args.source,
                 top_module=args.top,
@@ -80,7 +133,16 @@ def handle_stream(args) -> int:
                 include_sipo=not args.no_sipo,
                 include_piso=not args.no_piso,
                 debug=args.debug,
-                width=args.width or 0,
+                control_inputs=ctrl_in,
+                control_outputs=ctrl_out,
+                pingpong=args.pingpong,
+                bram_type=args.bram_type,
+                adapters=adapters_list,
+                input_source=args.input_source,
+                trigger_key=args.trigger_key,
+                numeric_width=args.numeric_width,
+                handshake_ports=_load_handshake_ports(args),
+                sync_mode=args.sync_mode,
             )
     print(json.dumps(result))
     return 0 if result.get('success') else 1
@@ -120,6 +182,14 @@ Examples:
         '--output', '-o',
         type=str,
         help='Output Verilog file path (default: <mif_name>.v)'
+    )
+    bram_parser.add_argument(
+        '--bram-type', '-t',
+        type=str,
+        choices=list(bram_generator.BRAM_TYPES.keys()),
+        default='ram4s',
+        help='BRAM primitive family (default: ram4s). Determines which (width, depth) '
+             'combinations are accepted.'
     )
     
     pll_parser = subparsers.add_parser(
@@ -195,6 +265,55 @@ Examples:
         help='Include overflow/idle/busy debug status ports on the top module')
     stream_parser.add_argument('--print-modules', action='store_true',
         help='Parse --source and print discovered modules/ports as JSON, then exit')
+    stream_parser.add_argument('--control-inputs', type=str, default=None,
+        help='Comma-separated control input port names to expose on wrapper top-level')
+    stream_parser.add_argument('--control-outputs', type=str, default=None,
+        help='Comma-separated control output port names to expose on wrapper top-level')
+    stream_parser.add_argument('--pingpong', action='store_true',
+        help='Generate double-buffered (ping-pong) wrapper with 4 BRAM instances')
+    stream_parser.add_argument('--bram-type', type=str, default='ram4s',
+        choices=['ram4s', 'ram8b', 'ramb18e1', 'ramb36e1', 'generic'],
+        help='BRAM primitive family (default: ram4s = Xilinx Spartan-6 / Fudan FDP3P7)')
+    stream_parser.add_argument('--adapter', action='append', default=None,
+        help='Physical device adapter binding. Format: TYPE:PORT[,PORT...] '
+             'e.g. --adapter ps2:key_state[63:0],mod_state[7:0]. '
+             'May be repeated for multiple adapters.')
+    stream_parser.add_argument('--input-source',
+        choices=list(stream_generator.VALID_INPUT_SOURCES),
+        default='rabbit',
+        help='Stream input source: "rabbit" (default 3-wire serial from host) '
+             'or "adapter" (PS/2 keyboard via the bridge module; requires '
+             '--adapter ps2).')
+    stream_parser.add_argument('--trigger-key',
+        choices=list(stream_generator.TRIGGER_BIT.keys()),
+        default='enter',
+        help='Which PS/2 key triggers the bridge into computing '
+             '(only used with --input-source adapter). Default: enter.')
+    stream_parser.add_argument('--numeric-width', type=int, default=32,
+        choices=[8, 16, 32, 64],
+        help='Width of the numeric accumulator (only used with '
+             '--input-source adapter for BRAM-depth validation). '
+             'Default: 32.')
+    stream_parser.add_argument('--sync-mode', action='store_true',
+        help='Use lightweight synchronous SIPO/PISO (no async FIFO, no baud-div '
+             'serial clock). Reduces LUT overhead by ~50%% for single-clock-domain '
+             'designs. The wrapper top-level port interface is unchanged.')
+    stream_parser.add_argument('--handshake-config', type=str, default=None,
+        help='Path to a JSON file with role→port-name mappings. '
+             'Each key (clock/reset/start/done/busy) maps to a list of '
+             'Verilog port names that satisfy that role. Replaces the '
+             'built-in defaults wholesale; use --*-ports flags to override '
+             'individual roles on top of the file.')
+    stream_parser.add_argument('--clock-ports', type=str, default=None,
+        help='Comma-separated clock port names (overrides --handshake-config).')
+    stream_parser.add_argument('--reset-ports', type=str, default=None,
+        help='Comma-separated reset port names (overrides --handshake-config).')
+    stream_parser.add_argument('--start-ports', type=str, default=None,
+        help='Comma-separated start port names (overrides --handshake-config).')
+    stream_parser.add_argument('--done-ports', type=str, default=None,
+        help='Comma-separated done port names (overrides --handshake-config).')
+    stream_parser.add_argument('--busy-ports', type=str, default=None,
+        help='Comma-separated busy port names (overrides --handshake-config).')
 
     return parser
 

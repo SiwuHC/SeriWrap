@@ -1,0 +1,8 @@
+{
+  "_comment": "Default handshake port-name aliases. Each key is a logical role; values are the Verilog port names that satisfy that role. CLI flags (--clock-ports, --reset-ports, etc.) override these; a complete file passed via --handshake-config replaces them.",
+  "clock": ["clk", "clock", "ap_clk"],
+  "reset": ["rst_n", "rst", "reset_n", "reset", "ap_rst", "ap_rst_n"],
+  "start": ["start", "go", "begin", "trigger", "ap_start"],
+  "done":  ["done", "valid", "finish", "complete", "ap_done"],
+  "busy":  ["busy", "ready", "ap_ready", "ap_idle"]
+}

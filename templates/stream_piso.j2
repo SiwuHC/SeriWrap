@@ -3,7 +3,11 @@
  *  File: stream_piso.v
  *  Author: UFDE+ IP Generator
  *  Date: {{ generation_date }}
- *
+ *==============================================================*/
+`timescale 1ns / 1ps
+
+
+/*
  *  Parallel-N-bit Parallel-In-Serial-Out with BRAM read.
  *
  *  On `start`, drives BRAM address and reads COUNT words from
@@ -19,7 +23,12 @@
  *    ADDR_W   - BRAM address bus width
  *=============================================================*/
 
-module {{ top_module }}__stream_piso (
+module {{ top_module }}__stream_piso #(
+    parameter WIDTH    = {{ width }},
+    parameter COUNT    = {{ count }},
+    parameter BAUD_DIV = {{ baud_div }},
+    parameter ADDR_W   = {{ addr_w }}
+) (
     input  wire               clk,        // system clock
     input  wire               rst_n,
     input  wire               start,
@@ -37,11 +46,6 @@ module {{ top_module }}__stream_piso (
     output reg                busy,
     output reg                done
 );
-
-    parameter WIDTH    = {{ width }};
-    parameter COUNT    = {{ count }};
-    parameter BAUD_DIV = {{ baud_div }};
-    parameter ADDR_W   = {{ addr_w }};
 
     reg [1:0]                       state;
     reg [$clog2(BAUD_DIV):0]        tick_cnt;
@@ -68,6 +72,12 @@ module {{ top_module }}__stream_piso (
                     s_data_valid <= 1'b0;
                     s_clk_out    <= 1'b0;
                     busy         <= 1'b0;
+                    // Explicitly keep Port B at addr 0 while idle so
+                    // BRAM's registered DOB latches mem[0].  When the
+                    // next start pulse fires, s_data_out <- bram_dout
+                    // samples mem[0] without any settle-cycle race,
+                    // regardless of what address ST_SEND left behind.
+                    bram_addr    <= 0;
                     if (start) begin
                         s_data_valid <= 1'b1;
                         s_clk_out    <= 1'b0;

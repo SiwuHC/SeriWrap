@@ -3,25 +3,46 @@
  *  File: stream_sipo.v
  *  Author: UFDE+ IP Generator
  *  Date: {{ generation_date }}
+ *==============================================================*/
+`timescale 1ns / 1ps
+
+
+/*
+ *  Parallel-N-bit Serial-In-Parallel-Out with async-FIFO input.
  *
- *  Parallel-N-bit Serial-In-Parallel-Out with BRAM write.
+ *  The producer (s_clk_in domain) writes `data_in` into a Gray-coded
+ *  asynchronous FIFO whenever `strobe_in` is high on a `s_clk_in` rising
+ *  edge.  The consumer (system clock domain) drains the FIFO and
+ *  writes each byte to bram at the current bram_addr.  After COUNT
+ *  words have been written, `done` is asserted for 1 cycle.
  *
- *  Each clk_in rising edge: if strobe_in == 1, sample data_in[15:0]
- *  and write it to bram at the current bram_addr.  If strobe_in == 0,
- *  ignore.  After COUNT words have been received, assert done for
- *  1 cycle (asserted on the same cycle as the last write).
+ *  Cross-domain timing note:
+ *    The async FIFO registers both its read data (`r_data`) and its
+ *    empty flag (`r_empty`) with matching 1-cycle latency.  Because
+ *    r_re is hardwired to 1'b1 here (the FIFO always tries to drain)
+ *    and the FIFO gates its internal read on the *combinational* empty
+ *    flag, `fifo_rdata` carries a fresh valid word on exactly the
+ *    cycles where `fifo_empty == 0`.  The consumer can therefore
+ *    capture `fifo_rdata` unconditionally whenever `!fifo_empty`, with
+ *    no warm-up/skip logic.
  *
  *  Parameters:
- *    WIDTH  - bit width of each parallel data word
- *    COUNT  - number of words to receive before done
- *    ADDR_W - BRAM address bus width
+ *    WIDTH        - bit width of each parallel data word
+ *    COUNT        - number of words to receive before done
+ *    ADDR_W       - BRAM address bus width
+ *    FIFO_ADDR_W  - async-FIFO pointer width; FIFO depth = 2^FIFO_ADDR_W
  *=============================================================*/
 
-module {{ top_module }}__stream_sipo (
+module {{ top_module }}__stream_sipo #(
+    parameter WIDTH        = {{ width }},
+    parameter COUNT        = {{ count }},
+    parameter ADDR_W       = {{ addr_w }},
+    parameter FIFO_ADDR_W  = {{ fifo_addr_w }}
+) (
     input  wire               clk,         // system clock
     input  wire               rst_n,
 
-    // Parallel input from Rabbit
+    // Parallel input from Rabbit (s_clk_in domain)
     input  wire [WIDTH-1:0]  data_in,
     input  wire               clk_in,
     input  wire               strobe_in,
@@ -34,29 +55,61 @@ module {{ top_module }}__stream_sipo (
     // Status
     output reg  [ADDR_W-1:0]  write_count,
     output reg                done,
-    output reg                overflow
+    output reg                overflow,
+
+    // Soft batch reset.  When HIGH, the SIPO is held in reset
+    // (clears write_count, done, overflow, sipo_warm).  Tie LOW
+    // (1'b0) for the standard (single-batch) wrapper.
+    input  wire               batch_arm
 );
 
-    parameter WIDTH  = {{ width }};
-    parameter COUNT  = {{ count }};
-    parameter ADDR_W = {{ addr_w }};
+    // ----------------------------------------------------------------
+    // Async FIFO signals
+    // ----------------------------------------------------------------
+    wire               fifo_full;
+    wire               fifo_empty;
+    wire [WIDTH-1:0]   fifo_rdata;
 
-    // 3-stage synchronizers for metastability protection
-    reg [2:0]            clk_sync;
-    reg [2:0]            strobe_sync;
-    reg [WIDTH-1:0]      data_sync [0:2];
-    reg                  prev_clk;
+    stream_async_fifo #(
+        .WIDTH (WIDTH),
+        .ADDR_W(FIFO_ADDR_W)
+    ) u_async_fifo (
+        .w_clk   (clk_in),
+        .w_rst_n (rst_n),
+        .w_we    (strobe_in),
+        .w_data  (data_in),
+        .r_clk   (clk),
+        .r_rst_n (rst_n),
+        .r_re    (1'b1),                  // always try to drain
+        .r_data  (fifo_rdata),
+        .r_empty (fifo_empty),
+        .w_full  (fifo_full)
+    );
 
-    wire clk_rising = (prev_clk == 1'b0) && (clk_sync[2] == 1'b1);
+    // ----------------------------------------------------------------
+    // System-clock domain: drain FIFO into BRAM
+    //
+    // Cross-domain latency: 2-FF pointer sync + 1-cycle registered
+    // empty flag + 1-cycle registered r_data.  The async FIFO registers
+    // its read data and its empty flag with MATCHING 1-cycle latency, so
+    // `fifo_rdata` carries a fresh valid word on exactly the cycles where
+    // `fifo_empty == 0`.  No warm-up skip is required: the consumer may
+    // capture `fifo_rdata` unconditionally whenever `!fifo_empty`.
+    // ----------------------------------------------------------------
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            clk_sync    <= 3'b000;
-            strobe_sync <= 3'b000;
-            data_sync[0] <= {WIDTH{1'b0}};
-            data_sync[1] <= {WIDTH{1'b0}};
-            data_sync[2] <= {WIDTH{1'b0}};
-            prev_clk     <= 1'b0;
+            bram_addr    <= 0;
+            bram_din     <= 0;
+            bram_we      <= 1'b0;
+            write_count  <= 0;
+            done         <= 1'b0;
+            overflow     <= 1'b0;
+        end else if (batch_arm) begin
+            // Soft batch boundary reset.  The async FIFO is NOT reset
+            // here — it continues to accept bytes from the producer;
+            // the read side simply stops draining until the next
+            // batch starts.
             bram_addr    <= 0;
             bram_din     <= 0;
             bram_we      <= 1'b0;
@@ -64,32 +117,27 @@ module {{ top_module }}__stream_sipo (
             done         <= 1'b0;
             overflow     <= 1'b0;
         end else begin
-            clk_sync    <= {clk_sync[1:0],    clk_in};
-            strobe_sync <= {strobe_sync[1:0], strobe_in};
-            data_sync[0] <= data_in;
-            data_sync[1] <= data_sync[0];
-            data_sync[2] <= data_sync[1];
-            prev_clk     <= clk_sync[2];
-
-            bram_we <= 1'b0;
-            done    <= 1'b0;
+            bram_we  <= 1'b0;
+            done     <= 1'b0;
             overflow <= 1'b0;
 
-            if (clk_rising && strobe_sync[2] == 1'b1) begin
-                if (write_count < COUNT) begin
-                    bram_we   <= 1'b1;
-                    bram_din  <= data_sync[2];
-                    bram_addr <= write_count;
-                    write_count <= write_count + 1;
-                end else begin
-                    // We've already received COUNT words but Rabbit
-                    // is still sending strobe=1 — overflow.
-                    overflow <= 1'b1;
-                end
+            // Drain the FIFO into BRAM while we still need more bytes.
+            if (!fifo_empty && write_count < COUNT) begin
+                bram_we     <= 1'b1;
+                bram_din    <= fifo_rdata;
+                bram_addr   <= write_count;
+                write_count <= write_count + 1'b1;
+
+                // done pulse on the same cycle as the last write
                 if (write_count == COUNT - 1) begin
-                    // Assert done on the same cycle as the last write.
                     done <= 1'b1;
                 end
+            end
+
+            // overflow: we already have COUNT bytes, but FIFO still
+            // has data (Rabbit is still sending strobe=1).
+            if (write_count >= COUNT && !fifo_empty) begin
+                overflow <= 1'b1;
             end
         end
     end

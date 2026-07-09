@@ -1,0 +1,88 @@
+/*==============================================================
+ *  File: stream_piso.v  (sync-mode — no baud-rate serial clock)
+ *  Author: UFDE+ IP Generator
+ *  Date: {{ generation_date }}
+ *==============================================================*/
+`timescale 1ns / 1ps
+
+
+/*
+ *  Sync-mode Parallel-In-Serial-Out with BRAM read.
+ *
+ *  Unlike the standard PISO which generates a BAUD_DIV-divided serial
+ *  clock (`s_clk_out`), the sync variant streams one word per system
+ *  clock cycle after `start` is asserted.  `s_clk_out` is tied LOW
+ *  (backward-compatible port).  This removes the tick counter and
+ *  state machine overhead for designs that do not need a slow serial
+ *  output clock.
+ *
+ *  Parameters:
+ *    WIDTH    - bit width of each parallel data word
+ *    COUNT    - number of words to send
+ *    ADDR_W   - BRAM address bus width
+ *=============================================================*/
+
+module {{ top_module }}__stream_piso #(
+    parameter WIDTH    = {{ width }},
+    parameter COUNT    = {{ count }},
+    parameter ADDR_W   = {{ addr_w }}
+) (
+    input  wire               clk,
+    input  wire               rst_n,
+    input  wire               start,
+
+    output reg  [ADDR_W-1:0]  bram_addr,
+    input  wire [WIDTH-1:0]   bram_dout,
+
+    output reg  [WIDTH-1:0]   s_data_out,
+    output wire               s_clk_out,    // unused, kept for port compat
+    output reg                s_data_valid,
+    output reg                busy,
+    output reg                done
+);
+
+    assign s_clk_out = 1'b0;
+
+    reg [ADDR_W-1:0] word_cnt;
+    reg              running;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            bram_addr    <= 0;
+            s_data_out   <= 0;
+            s_data_valid <= 1'b0;
+            busy         <= 1'b0;
+            done         <= 1'b0;
+            word_cnt     <= 0;
+            running      <= 1'b0;
+        end else begin
+            done <= 1'b0;
+
+            if (start && !running) begin
+                running      <= 1'b1;
+                busy         <= 1'b1;
+                word_cnt     <= 0;
+                bram_addr    <= 0;
+                s_data_valid <= 1'b0;
+            end else if (running) begin
+                // Pipeline: bram_addr was set last cycle, bram_dout is now valid
+                s_data_valid <= 1'b1;
+                s_data_out   <= bram_dout;
+                if (word_cnt == COUNT - 1) begin
+                    running      <= 1'b0;
+                    busy         <= 1'b0;
+                    s_data_valid <= 1'b0;
+                    done         <= 1'b1;
+                end else begin
+                    word_cnt  <= word_cnt + 1;
+                    bram_addr <= bram_addr + 1;
+                end
+            end else begin
+                s_data_valid <= 1'b0;
+                busy         <= 1'b0;
+                bram_addr    <= 0;
+            end
+        end
+    end
+
+endmodule

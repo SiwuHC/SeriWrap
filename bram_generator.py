@@ -11,22 +11,142 @@ from jinja2 import Environment, FileSystemLoader
 
 _RADIX_MAP = {'DEC': 'DEC', 'HEX': 'HEX', 'BIN': 'BIN', 'OCT': 'OCT', 'UNS': 'UNS'}
 
-# Valid (width, depth) combinations - 25 configs total
-# Group 1 (4096 bits): 1x4096, 2x2048, 4x1024, 8x512, 16x256
-# Group 2 (8192 bits): 2x4096, 4x2048, 8x1024, 16x512, 32x256
-# Group 3 (16384 bits): 4x4096, 8x2048, 16x1024, 32x512, 64x256
-# Group 4 (32768 bits): 8x4096, 16x2048, 32x1024, 64x512, 128x256
-# Group 5 (65536 bits): 16x4096, 32x2048, 64x1024, 128x512, 256x256
-_VALID_COMBINATIONS = {
-    (1, 4096), (2, 2048), (4, 1024), (8, 512), (16, 256),
-    (2, 4096), (4, 2048), (8, 1024), (16, 512), (32, 256),
-    (4, 4096), (8, 2048), (16, 1024), (32, 512), (64, 256),
-    (8, 4096), (16, 2048), (32, 1024), (64, 512), (128, 256),
-    (16, 4096), (32, 2048), (64, 1024), (128, 512), (256, 256)
+# =============================================================================
+#  BRAM primitive type registry
+# =============================================================================
+#  Each entry describes one supported BRAM primitive family.  The external
+#  port interface (ADDRA, CLKA, ENA, WEA, DOA, ADDRB, DIB, CLKB, ENB, WEB,
+#  DOB) is identical across types; only the *internal* primitive
+#  instantiation and INIT layout differ.
+#
+#  Schema:
+#    primitive_size_bits  — total bits per physical primitive instance
+#    init_lines           — number of INIT_xx parameters per primitive
+#    init_bits_per_line   — bits per INIT parameter
+#    valid_combinations   — set of (width, depth) tuples that the primitive
+#                           family supports natively; None for "any"
+#    template             — Jinja2 template filename (without .j2)
+#    description          — human-readable label
+# =============================================================================
+BRAM_TYPES = {
+    "ram4s": {
+        "description": "Xilinx Spartan-6 / Fudan FDP3P7 (RAMB4_S*)",
+        "primitive_size_bits": 4096,
+        "init_lines": 16,
+        "init_bits_per_line": 256,
+        "valid_combinations": {
+            (1, 4096), (2, 2048), (4, 1024), (8, 512), (16, 256),
+            (2, 4096), (4, 2048), (8, 1024), (16, 512), (32, 256),
+            (4, 4096), (8, 2048), (16, 1024), (32, 512), (64, 256),
+            (8, 4096), (16, 2048), (32, 1024), (64, 512), (128, 256),
+            (16, 4096), (32, 2048), (64, 1024), (128, 512), (256, 256),
+        },
+        "template": "bram_template.j2",
+    },
+    "ram8b": {
+        "description": "Xilinx Spartan-6 (RAMB8BWER)",
+        "primitive_size_bits": 1024,
+        "init_lines": 16,
+        "init_bits_per_line": 64,
+        "valid_combinations": {
+            (1, 1024), (2, 512), (4, 256), (8, 128), (16, 64), (32, 32),
+            (1, 2048), (2, 1024), (4, 512), (8, 256), (16, 128),
+            (1, 4096), (2, 2048), (4, 1024), (8, 512), (16, 256),
+            (1, 8192), (2, 4096), (4, 2048), (8, 1024),
+            (1, 16384), (2, 8192), (4, 4096),
+            (1, 32768), (2, 16384),
+            (1, 65536),
+        },
+        "template": "bram_template_ram8b.j2",
+    },
+    "ramb18e1": {
+        "description": "Xilinx 7-series (RAMB18E1, 18Kb TDP)",
+        "primitive_size_bits": 16384,   # 16,384 data bits (64 lines * 256)
+        "init_lines": 64,
+        "init_bits_per_line": 256,
+        # TDP mode, widths 1/2/4/8/16 (no parity). 18/36 modes omitted.
+        "valid_combinations": {
+            # 1-bit
+            (1, 16384), (1, 8192), (1, 4096), (1, 2048), (1, 1024), (1, 512),
+            # 2-bit
+            (2, 8192), (2, 4096), (2, 2048), (2, 1024), (2, 512),
+            # 4-bit
+            (4, 4096), (4, 2048), (4, 1024), (4, 512), (4, 256),
+            # 8-bit
+            (8, 2048), (8, 1024), (8, 512), (8, 256), (8, 128),
+            # 16-bit
+            (16, 1024), (16, 512), (16, 256), (16, 128), (16, 64),
+        },
+        "template": "bram_template_ramb18e1.j2",
+    },
+    "ramb36e1": {
+        "description": "Xilinx 7-series / UltraScale (RAMB36E1, 36Kb TDP)",
+        "primitive_size_bits": 32768,   # 32,768 data bits (64 lines * 256 * 2)
+        "init_lines": 64,
+        "init_bits_per_line": 256,
+        # TDP mode, widths 1/2/4/8/16/32 (no parity). 18/36 modes omitted.
+        "valid_combinations": {
+            # 1-bit
+            (1, 32768), (1, 16384), (1, 8192), (1, 4096), (1, 2048), (1, 1024),
+            # 2-bit
+            (2, 16384), (2, 8192), (2, 4096), (2, 2048), (2, 1024),
+            # 4-bit
+            (4, 8192), (4, 4096), (4, 2048), (4, 1024), (4, 512),
+            # 8-bit
+            (8, 4096), (8, 2048), (8, 1024), (8, 512), (8, 256), (8, 128),
+            # 16-bit
+            (16, 2048), (16, 1024), (16, 512), (16, 256), (16, 128),
+            # 32-bit
+            (32, 1024), (32, 512), (32, 256), (32, 128), (32, 64),
+        },
+        "template": "bram_template_ramb36e1.j2",
+    },
+    "generic": {
+        "description": "Behavioral (pure Verilog, portable, no vendor IP)",
+        "primitive_size_bits": None,   # N/A
+        "init_lines": 0,
+        "init_bits_per_line": 0,
+        "valid_combinations": None,     # any (width, depth) accepted
+        "template": "bram_template_generic.j2",
+    },
 }
 
-def _validate_combination(width: int, depth: int, port_name: str = "port") -> bool:
-    return (width, depth) in _VALID_COMBINATIONS
+# Xilinx 7-series RAMB18E1/RAMB36E1 only accept data-width values from the
+# parity-mode set {0,1,2,4,9,18,36}.  The framework exposes "naked" widths
+# {1,2,4,8,16,32} to users; we map them to the nearest valid primitive width
+# by reserving the top bits for parity (which we tie to 0).  This mapping is
+# used only for the defparam values (READ/WRITE_WIDTH_A/B) — the external
+# data port widths stay at the user-requested value.
+_PARITY_MODE_WIDTHS = {1: 1, 2: 2, 4: 4, 8: 9, 16: 18, 32: 36}
+
+
+def _map_to_prim_width(user_width: int) -> int:
+    """Map a user-facing width to the nearest valid RAMB18E1/36E1 width.
+
+    The user-facing widths we support are 1, 2, 4, 8, 16, 32.  The
+    Xilinx 7-series primitives reject 8/16/32 directly and require
+    the corresponding parity-mode values 9/18/36.
+    """
+    if user_width in _PARITY_MODE_WIDTHS:
+        return _PARITY_MODE_WIDTHS[user_width]
+    raise ValueError(
+        f"Width {user_width} not supported by ramb18e1/ramb36e1. "
+        f"Supported: {sorted(_PARITY_MODE_WIDTHS)}"
+    )
+
+# Backward-compat: keep module-level _VALID_COMBINATIONS for old callers
+# (defaults to ram4s set)
+_VALID_COMBINATIONS = BRAM_TYPES["ram4s"]["valid_combinations"]
+
+def _validate_combination(width: int, depth: int, port_name: str = "port",
+                          bram_type: str = "ram4s") -> bool:
+    if bram_type not in BRAM_TYPES:
+        raise ValueError(f"Unknown BRAM type: {bram_type}. "
+                         f"Valid: {list(BRAM_TYPES.keys())}")
+    valid = BRAM_TYPES[bram_type]["valid_combinations"]
+    if valid is None:
+        return True   # generic: any combo
+    return (width, depth) in valid
 
 def _parse_data(data_str: str, data_radix: str) -> int:
     data_str = data_str.strip()
@@ -41,7 +161,7 @@ def _parse_data(data_str: str, data_radix: str) -> int:
     else:
         return int(data_str)
 
-def read_mif(path: str) -> Dict[str, Any]:
+def read_mif(path: str, bram_type: str = "ram4s") -> Dict[str, Any]:
     result = {
         'mode': 'unknown', 'width': 0, 'depth': 0, 'widthA': 0, 'widthB': 0,
         'depthA': 0, 'depthB': 0, 'address_radix': 'DEC', 'data_radix': 'HEX',
@@ -102,17 +222,20 @@ def read_mif(path: str) -> Dict[str, Any]:
         if result['mode'] == 'single':
             if result['width'] <= 0 or result['depth'] <= 0:
                 raise ValueError(f"Single-port mode parameters invalid: width={result['width']}, depth={result['depth']}")
-            if not _validate_combination(result['width'], result['depth']):
-                raise ValueError(f"Invalid single-port combination: width={result['width']}, depth={result['depth']}. Must be one of: {sorted(_VALID_COMBINATIONS)}")
+            if not _validate_combination(result['width'], result['depth'], bram_type=bram_type):
+                valid_set = BRAM_TYPES[bram_type]["valid_combinations"]
+                raise ValueError(f"Invalid single-port combination for {bram_type}: width={result['width']}, depth={result['depth']}. Must be one of: {sorted(valid_set) if valid_set else 'any'}")
             depth = result['depth']
             width = result['width']
         else:
             if result['widthA'] <= 0 or result['depthA'] <= 0 or result['widthB'] <= 0 or result['depthB'] <= 0:
                 raise ValueError(f"Dual-port mode parameters invalid: A(w={result['widthA']},d={result['depthA']}), B(w={result['widthB']},d={result['depthB']})")
-            if not _validate_combination(result['widthA'], result['depthA']):
-                raise ValueError(f"Invalid dual-port combination for port A: width={result['widthA']}, depth={result['depthA']}. Must be one of: {sorted(_VALID_COMBINATIONS)}")
-            if not _validate_combination(result['widthB'], result['depthB']):
-                raise ValueError(f"Invalid dual-port combination for port B: width={result['widthB']}, depth={result['depthB']}. Must be one of: {sorted(_VALID_COMBINATIONS)}")
+            if not _validate_combination(result['widthA'], result['depthA'], bram_type=bram_type):
+                valid_set = BRAM_TYPES[bram_type]["valid_combinations"]
+                raise ValueError(f"Invalid dual-port combination for port A ({bram_type}): width={result['widthA']}, depth={result['depthA']}. Must be one of: {sorted(valid_set) if valid_set else 'any'}")
+            if not _validate_combination(result['widthB'], result['depthB'], bram_type=bram_type):
+                valid_set = BRAM_TYPES[bram_type]["valid_combinations"]
+                raise ValueError(f"Invalid dual-port combination for port B ({bram_type}): width={result['widthB']}, depth={result['depthB']}. Must be one of: {sorted(valid_set) if valid_set else 'any'}")
             if (result['widthA'] * result['depthA']) != (result['widthB'] * result['depthB']):
                 raise ValueError("Dual-port capacity mismatch")
             depth = result['depthA']
@@ -131,87 +254,167 @@ def read_mif(path: str) -> Dict[str, Any]:
         result['error'] = str(e)
     return result
 
-def generate_bram_ip(module_name: str, width_A: int, depth_A: int, width_B: int, depth_B: int, raw_data_array: list) -> dict:
+def _compute_init_data(module_number: int, width_A_one: int, depth_A: int,
+                       init_lines_per_primitive: int, init_bits_per_line: int,
+                       raw_data_array: list) -> List[List[str]]:
+    """Compute INIT parameter strings for one or more BRAM primitives.
+
+    Splits the data array across `module_number` primitives, each
+    holding `width_A_one` bits × `depth_A` addresses.  Each INIT
+    line covers (init_bits_per_line / width_A_one) addresses.
+
+    Returns: list of `module_number` lists, each of `init_lines_per_primitive`
+             hex strings of the form "{init_bits_per_line}'h<hex>".
     """
-    Generate BRAM IP Verilog code.
-    
+    init_data = []
+    addresses_per_init = init_bits_per_line // width_A_one
+
+    for module_idx in range(module_number):
+        module_init_strings = []
+        bit_start = module_idx * width_A_one
+
+        for group_idx in range(init_lines_per_primitive):
+            start_addr = group_idx * addresses_per_init
+            end_addr = min(start_addr + addresses_per_init, depth_A)
+
+            # Collect data for this group, from highest address to lowest (for INIT format)
+            group_binary_str = ''
+            for addr in range(end_addr - 1, start_addr - 1, -1):
+                if addr < len(raw_data_array):
+                    data_val = (raw_data_array[addr] >> bit_start) & ((1 << width_A_one) - 1)
+                else:
+                    data_val = 0
+                group_binary_str += format(data_val, f'0{width_A_one}b')
+
+            # Pad to init_bits_per_line if necessary
+            if end_addr - start_addr < addresses_per_init:
+                padding_bits = (addresses_per_init - (end_addr - start_addr)) * width_A_one
+                group_binary_str += '0' * padding_bits
+
+            # Convert binary string to hex
+            hex_str = ''.join(
+                format(int(group_binary_str[i:i+4], 2), 'x')
+                for i in range(0, init_bits_per_line, 4)
+            )
+            module_init_strings.append(f"{init_bits_per_line}'h{hex_str}")
+
+        init_data.append(module_init_strings)
+    return init_data
+
+
+def generate_bram_ip(module_name: str, width_A: int, depth_A: int, width_B: int, depth_B: int, raw_data_array: list,
+                     bram_type: str = "ram4s") -> dict:
+    """
+    Generate BRAM IP Verilog code for the given primitive family.
+
     Args:
-        module_name: Name of the module
-        width_A: Width of port A
-        depth_A: Depth of port A
-        width_B: Width of port B (0 for single-port)
-        depth_B: Depth of port B (1 for single-port)
-        raw_data_array: Initial data array
-    
+        module_name:     Name of the module
+        width_A:         Width of port A
+        depth_A:         Depth of port A
+        width_B:         Width of port B (0 for single-port)
+        depth_B:         Depth of port B (1 for single-port)
+        raw_data_array:  Initial data array
+        bram_type:       One of BRAM_TYPES keys: 'ram4s' | 'ram8b' | 'ramb18e1' |
+                         'ramb36e1' | 'generic'
+
     Returns:
-        Dictionary with result information
+        Dictionary with result information including 'verilog_code'.
     """
     try:
+        if bram_type not in BRAM_TYPES:
+            return {
+                'success': False,
+                'error': f"Unknown BRAM type '{bram_type}'. Valid: {list(BRAM_TYPES.keys())}",
+                'message': 'Invalid bram_type',
+            }
+
+        type_cfg = BRAM_TYPES[bram_type]
         template_dir = os.path.dirname(os.path.abspath(__file__))
         env = Environment(loader=FileSystemLoader(template_dir), trim_blocks=True, lstrip_blocks=True)
         env.filters['format_hex'] = lambda x: f"{x:02X}"
-        template = env.get_template('templates/bram_template.j2')
-        module_number = int(width_A * depth_A / 4096)
-        width_A_one, width_B_one = int(width_A/module_number), int(width_B/module_number)
-        
-        # Each RAM module is 4KB (4096 bits), organized as 16 INIT params x 256 bits each
-        # Calculate how many addresses fit in one INIT param based on width
-        # For width=1: 256 addresses per INIT (256 bits / 1 bit = 256)
-        # For width=4: 64 addresses per INIT (256 bits / 4 bits = 64)
-        # For width=8: 32 addresses per INIT (256 bits / 8 bits = 32)
-        # For width=16: 16 addresses per INIT (256 bits / 16 bits = 16)
-        addresses_per_init = 256 // width_A_one
+        template = env.get_template(f"templates/{type_cfg['template']}")
+
+        gen_date = datetime.now().strftime("%Y.%m.%d")
+
+        # ---- Generic (behavioral) path: no INIT, simple param-driven ----
+        if bram_type == "generic":
+            addr_w = max(1, int(math.ceil(math.log2(depth_A))))
+            template_params = {
+                'module_name': module_name,
+                'width_A': width_A, 'width_B': width_B,
+                'addr_w': addr_w, 'depth': depth_A,
+                'generation_date': gen_date,
+            }
+            verilog_code = template.render(**template_params)
+            return {
+                'success': True,
+                'verilog_code': verilog_code,
+                'message': f"BRAM IP (generic behavioral) generated: {module_name}.v"
+            }
+
+        # ---- Primitive-based path (ram4s, ram8b, ramb18e1, ramb36e1, ...) ----
+        prim_size = type_cfg['primitive_size_bits']
+        init_lines_max = type_cfg['init_lines']
+        init_bits = type_cfg['init_bits_per_line']
+
+        # If the requested (width × depth) is smaller than one primitive, we
+        # still use a single primitive (with partial utilization).  This is
+        # the case for our 8×512 tests against ramb18e1 (16Kb) / ramb36e1
+        # (32Kb), which are much larger than the requested 4Kb.
+        module_number = max(1, int(width_A * depth_A / prim_size))
+        width_A_one = int(width_A / module_number)
+        width_B_one = int(width_B / module_number) if width_B > 0 else 0
+
+        # For primitives with large INIT space (ramb18e1=64, ramb36e1=64), we
+        # only need the lines that actually cover the requested depth.
+        addresses_per_init = init_bits // width_A_one
         init_lines_per_instance = (depth_A + addresses_per_init - 1) // addresses_per_init
-        
-        init_data = []
-        
-        for module_idx in range(module_number):
-            module_init_strings = []
-            
-            # For multi-module configs, extract the data bits for this module
-            # Each module handles a slice of the data width
-            bit_start = module_idx * width_A_one
-            
-            for group_idx in range(init_lines_per_instance):
-                start_addr = group_idx * addresses_per_init
-                end_addr = min(start_addr + addresses_per_init, depth_A)
-                
-                # Collect data for this group, from highest address to lowest (for INIT format)
-                group_binary_str = ''
-                for addr in range(end_addr - 1, start_addr - 1, -1):
-                    # Extract the data for this module from the raw data
-                    if addr < len(raw_data_array):
-                        data_val = (raw_data_array[addr] >> bit_start) & ((1 << width_A_one) - 1)
-                    else:
-                        data_val = 0
-                    group_binary_str += format(data_val, f'0{width_A_one}b')
-                
-                # Pad to 256 bits if necessary
-                if end_addr - start_addr < addresses_per_init:
-                    padding_bits = (addresses_per_init - (end_addr - start_addr)) * width_A_one
-                    group_binary_str += '0' * padding_bits
-                
-                # Convert binary string to hex (256 bits = 64 hex digits)
-                hex_str = ''.join(format(int(group_binary_str[i:i+4], 2), 'x') for i in range(0, 256, 4))
-                module_init_strings.append(f"256'h{hex_str}")
-            
-            init_data.append(module_init_strings)
-        
+        # Clamp to the max available INIT slots in the primitive.
+        init_lines_per_instance = min(init_lines_per_instance, init_lines_max)
+
+        # Compute INIT data layout
+        init_data = _compute_init_data(
+            module_number=module_number,
+            width_A_one=width_A_one,
+            depth_A=depth_A,
+            init_lines_per_primitive=init_lines_per_instance,
+            init_bits_per_line=init_bits,
+            raw_data_array=raw_data_array,
+        )
+
+        # For 7-series BRAMs, the defparam values for READ/WRITE_WIDTH must
+        # come from the parity-mode set {1,2,4,9,18,36}.  Map 8/16/32 → 9/18/36.
+        # External data-port widths stay at the user-requested value.
+        if bram_type in ("ramb18e1", "ramb36e1"):
+            prim_width_A = _map_to_prim_width(width_A)
+            prim_width_B = _map_to_prim_width(width_B) if width_B > 0 else 0
+        else:
+            prim_width_A = width_A
+            prim_width_B = width_B
+
         template_params = {
-            'module_name': module_name, 'width_A': width_A, 'depth_A': int(math.log2(depth_A)),
-            'width_A_one': width_A_one, 'width_B': width_B, 'depth_B': int(math.log2(depth_B)),
-            'width_B_one': width_B_one, 'init_data': init_data, 'module_number': module_number,
-            'generation_date': datetime.now().strftime("%Y.%m.%d")
+            'module_name': module_name,
+            'width_A': width_A, 'depth_A': int(math.log2(depth_A)),
+            'width_A_one': width_A_one,
+            'width_B': width_B, 'depth_B': int(math.log2(depth_B)) if depth_B > 1 else 0,
+            'width_B_one': width_B_one,
+            'prim_width_A': prim_width_A,
+            'prim_width_B': prim_width_B,
+            'init_data': init_data, 'module_number': module_number,
+            'generation_date': gen_date,
+            'init_bits_per_line': init_bits,
+            'init_lines_per_instance': init_lines_per_instance,
+            'init_lines_max': init_lines_max,
         }
-        
+
         verilog_code = template.render(**template_params)
-        
+
         return {
             'success': True,
             'verilog_code': verilog_code,
-            'message': f"BRAM IP generated successfully: {module_name}.v"
+            'message': f"BRAM IP ({bram_type}) generated: {module_name}.v"
         }
-        
+
     except Exception as e:
         return {
             'success': False,
@@ -219,18 +422,21 @@ def generate_bram_ip(module_name: str, width_A: int, depth_A: int, width_B: int,
             'message': f"Failed to generate BRAM IP: {e}"
         }
 
-def generate_bram_from_mif(mif_file: str, output_file: Optional[str] = None) -> dict:
+def generate_bram_from_mif(mif_file: str, output_file: Optional[str] = None,
+                           bram_type: str = "ram4s") -> dict:
     """
     Generate BRAM IP from MIF file.
-    
+
     Args:
         mif_file: Path to MIF file
         output_file: Optional output file path
-    
+        bram_type: BRAM primitive family (used for (width, depth) validation
+                   against the primitive's native valid combinations)
+
     Returns:
         Dictionary with result information
     """
-    mif_result = read_mif(mif_file)
+    mif_result = read_mif(mif_file, bram_type=bram_type)
     module_name = os.path.splitext(os.path.basename(mif_file))[0]
     
     if not mif_result['success']:
@@ -246,7 +452,7 @@ def generate_bram_from_mif(mif_file: str, output_file: Optional[str] = None) -> 
         width_B = 0 if mif_result['mode'] == 'single' else mif_result['widthB']
         depth_B = 1 if mif_result['mode'] == 'single' else mif_result['depthB']
         
-        result = generate_bram_ip(module_name, width_A, depth_A, width_B, depth_B, mif_result['data_array'])
+        result = generate_bram_ip(module_name, width_A, depth_A, width_B, depth_B, mif_result['data_array'], bram_type=bram_type)
         
         if result['success']:
             output_path = output_file or f"{module_name}.v"

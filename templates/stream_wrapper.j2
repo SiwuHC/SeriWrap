@@ -7,43 +7,89 @@
  *  Wraps user module `{{ top_module }}` with SIPO/PISO/BRAM glue
  *  to expose a parallel-N-bit 3-wire serial interface.
  *
- *  External port (N = WIDTH = bit-width of each parallel word):
- *    s_data_in[N-1:0], s_clk_in, s_strobe_in
- *    s_data_out[N-1:0], s_clk_out, s_data_valid
- *    overflow, idle, busy
+ *  Port classification:
+ *    - Handshake (clk/rst_n/start/done/busy): auto-detected
+ *    - Control ports: exposed on wrapper top-level
+ *    - Data ports: serialized through SIPO→BRAM→...→PISO
+ *
+ *  Heterogeneous widths supported: each data port keeps its
+ *  declared width; ports wider than WIDTH span multiple BRAM
+ *  entries (little-endian order).
+ *
+ *  External ports:
+ *    s_data_in[WIDTH-1:0], s_clk_in, s_strobe_in
+ *    s_data_out[WIDTH-1:0], s_clk_out, s_data_valid
+ *    control_input_*    (if any)
+ *    control_output_*   (if any)
+ *    overflow, idle, busy (if --debug)
  *
  *  Internal: instantiates stream_sipo, stream_piso, the user
  *  module, and two dual-port BRAMs.
  *
- *  FSM (no IDLE_TIMEOUT — sipo_done triggers immediately):
- *    C_IDLE      → wait for sipo_done
- *    C_LAUNCH    → copy INPUT_COUNT words from in_bram to user_in_reg
+ *  FSM:
+ *    C_IDLE      → wait for src_done
+ *    C_LAUNCH    → copy INPUT_COUNT words from in_bram to in_bram_buf,
+ *                   then assemble heterogeneous port wires
  *    C_COMPUTING → pulse user.start, wait for user.done
- *    C_DUMP      → copy OUTPUT_COUNT words from user_out_wire to out_bram
+ *    C_DUMP      → disassemble user outputs into out_buf, write to BRAM
  *    C_DONE      → trigger PISO
  *
- *  Companion files (must be compiled alongside):
+ *  Companion files:
  *    - {{ top_module }}__stream_sipo.v
  *    - {{ top_module }}__stream_piso.v
  *    - {{ top_module }}__stream_bram.v
  *    - {{ user_source }}  (user module)
  *=============================================================*/
+`timescale 1ns / 1ps
+
+{% set has_ctrl = control_input_ports|length > 0 or control_output_ports|length > 0 %}
+{% set serial_ports = (input_count > 0) or (output_count > 0) %}
 
 module {{ wrapper_module }} (
     input  wire                  clk,
-    input  wire                  rst_n,
+    input  wire                  rst_n{% if serial_ports or has_ctrl or debug %},{% endif %}
+{%- if input_count > 0 %}
 
-    // Parallel input from Rabbit
-    input  wire [{{ width - 1 }}:0]  s_data_in,
+    // Serial input from Rabbit
+    input  wire [{{ WIDTH - 1 }}:0]  s_data_in,
     input  wire                  s_clk_in,
-    input  wire                  s_strobe_in,
+    input  wire                  s_strobe_in{% if output_count > 0 or has_ctrl or debug %},{% endif %}
+{%- endif %}
+{%- if output_count > 0 %}
 
-    // Parallel output to Rabbit
-    output wire [{{ width - 1 }}:0]  s_data_out,
+    // Serial output to Rabbit
+    output wire [{{ WIDTH - 1 }}:0]  s_data_out,
     output wire                  s_clk_out,
-    output wire                  s_data_valid
+    output wire                  s_data_valid{% if has_ctrl or adapters|length > 0 or debug %},{% endif %}
+{%- endif %}
+{%- for cp in control_input_ports %}
+
+    // Control input: {{ cp.name }}
+    input  wire {% if cp.width > 1 %}[{{ cp.width - 1 }}:0] {% endif %} ctrl_{{ cp.name }}{% if not loop.last or control_output_ports|length > 0 or debug or adapters|length > 0 %},{% endif %}
+{%- endfor %}
+{%- for cp in control_output_ports %}
+
+    // Control output: {{ cp.name }}
+    output wire {% if cp.width > 1 %}[{{ cp.width - 1 }}:0] {% endif %} ctrl_{{ cp.name }}{% if not loop.last or debug or adapters|length > 0 %},{% endif %}
+{%- endfor %}
+{%- for ad in adapters %}
+{% if ad.name == 'ps2' %}
+
+    // Physical device adapter pins: {{ ad.name }}
+    input  wire                  ps2_clk,
+    input  wire                  ps2_data{% if not loop.last or debug %},{% endif %}
+{% elif ad.name == 'uart' %}
+
+    // Physical device adapter pin: {{ ad.name }}
+    input  wire                  uart_rx{% if not loop.last or debug %},{% endif %}
+{% elif ad.name == 'gpio' %}
+
+    // Physical device adapter pin: {{ ad.name }}
+    input  wire                  gpio_in{% if not loop.last or debug %},{% endif %}
+{% endif %}
+{%- endfor %}
 {%- if debug %}
-,
+
     // Debug status
     output wire                  overflow,
     output wire                  idle,
@@ -51,7 +97,7 @@ module {{ wrapper_module }} (
 {%- endif %}
 );
 
-    parameter WIDTH        = {{ width }};
+    parameter WIDTH        = {{ WIDTH }};
     parameter DEPTH        = {{ depth }};
     parameter ADDR_W       = {{ addr_w }};
     parameter INPUT_COUNT  = {{ input_count }};
@@ -59,15 +105,16 @@ module {{ wrapper_module }} (
     parameter IN_IDX_W     = {{ input_count_idx_w }};
     parameter OUT_IDX_W    = {{ output_count_idx_w }};
 
+{% if input_count > 0 %}
     // ============================================================
     // SIPO: writes each strobed word from s_data_in to in_bram
     // ============================================================
-    wire [ADDR_W-1:0]  sipo_addr;
-    wire [WIDTH-1:0]   sipo_din;
-    wire               sipo_we;
-    wire [ADDR_W-1:0]  sipo_write_count;
-    wire               sipo_done;
-    wire               sipo_ovf;
+    wire [ADDR_W-1:0]  src_addr;
+    wire [WIDTH-1:0]   src_din;
+    wire               src_we;
+    wire [ADDR_W-1:0]  src_wcnt;
+    wire               src_done;
+    wire               src_ovf;
 
     {{ top_module }}__stream_sipo u_sipo (
         .clk          (clk),
@@ -75,12 +122,13 @@ module {{ wrapper_module }} (
         .data_in      (s_data_in),
         .clk_in       (s_clk_in),
         .strobe_in    (s_strobe_in),
-        .bram_addr    (sipo_addr),
-        .bram_din     (sipo_din),
-        .bram_we      (sipo_we),
-        .write_count  (sipo_write_count),
-        .done         (sipo_done),
-        .overflow     (sipo_ovf)
+        .bram_addr    (src_addr),
+        .bram_din     (src_din),
+        .bram_we      (src_we),
+        .write_count  (src_wcnt),
+        .done         (src_done),
+        .overflow     (src_ovf),
+        .batch_arm    (src_arm)
     );
 
     // Input BRAM: SIPO writes Port A, wrapper reads Port B
@@ -88,52 +136,90 @@ module {{ wrapper_module }} (
     wire [WIDTH-1:0]   in_bram_dob;
 
     {{ bram_module }} u_in_bram (
-        .ADDRA(sipo_addr),
-        .DIA  (sipo_din),
+        .ADDRA(src_addr),
+        .DIA  (src_din),
         .CLKA (clk),
         .ENA  (1'b1),
-        .WEA  (sipo_we),
+        .WEA  (src_we),
         .DOA  (in_bram_doa_unused),
         .ADDRB(in_bram_rd_addr),
         .DIB  ({WIDTH{1'b0}}),
         .CLKB (clk),
-        .ENB  (1'b1),
+        .ENB  (in_bram_re),
         .WEB  (1'b0),
         .DOB  (in_bram_dob)
     );
-
+{% elif input_source == 'adapter' %}
     // ============================================================
-    // User module: combinational inputs (driven from user_in_reg)
-    // and outputs (sampled to user_out_wire)
-    //
-    // For array-typed user ports (e.g. `A [0:3][0:3]`), we
-    // concatenate the flattened element registers in row-major order.
-    // For scalar ports, we just connect the single reg.
+    // Bridge: SIPO drop-in replacement for --input-source adapter.
+    // Two operating modes, both producing a 1-cycle `src_done` pulse:
+    //   PS/2 mode     — key_state[TRIGGER_BIT] rising edge
+    //   Event mode    — UART data_valid / GPIO gpio_event pulse
+    // There is no input BRAM in adapter mode (input_count == 0).
     // ============================================================
-    reg  [WIDTH-1:0]  user_in_reg  [0:INPUT_COUNT-1];
-{% for p in user_output_data_port_names %}    wire [WIDTH-1:0]  user_out_{{ loop.index0 }};
-{% endfor %}    reg               user_start_wire;
-    wire              user_done_wire;
-{% if has_busy_port %}    wire              user_busy_wire;
-{% endif %}
+    wire [ADDR_W-1:0]  src_addr;
+    wire [WIDTH-1:0]   src_din;
+    wire               src_we;
+    wire [ADDR_W-1:0]  src_wcnt;
+    wire               src_done;
+    wire               src_ovf;
 
-    // Per-element wires for user data input ports.  Each user
-    // module data port is connected to one element of the
-    // user_in_reg[] array.  This works for both flat ports
-    // (`a0..a15`) and 2D array ports whose dimensions are
-    // flattened by the parser.
-{% for p in user_input_data_port_names %}    wire [WIDTH-1:0]  user_in_w_{{ p.name }} = user_in_reg[{{ p.index }}];
-{% endfor %}
-
-    {{ top_module }} u_user (
-        .clk        (clk),
-        .rst_n      (rst_n),
-{% for inp in user_input_data_port_names_grouped %}        .{{ inp.name }}    (user_in_w_{{ inp.name }}),
-{% endfor %}{% for p in user_output_data_port_names %}{% set outer_out_idx2 = loop.index0 %}        .{{ p.name }}    (user_out_{{ outer_out_idx2 }}),
-{% endfor %}        .{{ start_port }}    (user_start_wire),
-        .{{ done_port }}     (user_done_wire){% if has_busy_port %},
-        .{{ busy_port }}     (user_busy_wire){% endif %}
+{% for ad in adapters %}
+{% if ad.name == 'ps2' %}
+    {{ top_module }}__stream_bridge #(
+        .TRIGGER_BIT({{ trigger_bit }}),
+        .USE_TRIGGER_BIT(1)
+    ) u_bridge (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .key_state    (ad_ps2_key_state),
+        .event_in     (1'b0),
+        .done         (src_done),
+        .overflow     (src_ovf),
+        .bram_addr    (src_addr),
+        .bram_din     (src_din),
+        .bram_we      (src_we),
+        .write_count  (src_wcnt),
+        .batch_arm    (1'b0)
     );
+{% elif ad.name == 'uart' %}
+    {{ top_module }}__stream_bridge #(
+        .TRIGGER_BIT(0),
+        .USE_TRIGGER_BIT(0)
+    ) u_bridge (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .key_state    (64'd0),
+        .event_in     (ad_uart_data_valid),
+        .done         (src_done),
+        .overflow     (src_ovf),
+        .bram_addr    (src_addr),
+        .bram_din     (src_din),
+        .bram_we      (src_we),
+        .write_count  (src_wcnt),
+        .batch_arm    (1'b0)
+    );
+{% elif ad.name == 'gpio' %}
+    {{ top_module }}__stream_bridge #(
+        .TRIGGER_BIT(0),
+        .USE_TRIGGER_BIT(0)
+    ) u_bridge (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .key_state    (64'd0),
+        .event_in     (ad_gpio_gpio_event),
+        .done         (src_done),
+        .overflow     (src_ovf),
+        .bram_addr    (src_addr),
+        .bram_din     (src_din),
+        .bram_we      (src_we),
+        .write_count  (src_wcnt),
+        .batch_arm    (1'b0)
+    );
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if output_count > 0 %}
 
     // Output BRAM: wrapper writes Port A, PISO reads Port B
     wire [WIDTH-1:0]   out_bram_doa_unused;
@@ -149,7 +235,7 @@ module {{ wrapper_module }} (
         .ADDRB(piso_addr),
         .DIB  ({WIDTH{1'b0}}),
         .CLKB (clk),
-        .ENB  (1'b1),
+        .ENB  (out_bram_re),
         .WEB  (1'b0),
         .DOB  (out_bram_dob)
     );
@@ -164,14 +250,11 @@ module {{ wrapper_module }} (
     wire               piso_busy;
     wire               piso_done;
     reg                piso_start;
-    reg                piso_triggered;  // latch: only trigger once per cycle
+    reg                piso_triggered;
 
-    assign s_data_out  = piso_data_out;
-    assign s_clk_out   = piso_clk_out;
+    assign s_data_out   = piso_data_out;
+    assign s_clk_out    = piso_clk_out;
     assign s_data_valid = piso_data_valid;
-{%- if debug %}
-    assign overflow    = sipo_ovf;
-{%- endif %}
 
     {{ top_module }}__stream_piso u_piso (
         .clk          (clk),
@@ -185,81 +268,255 @@ module {{ wrapper_module }} (
         .busy         (piso_busy),
         .done         (piso_done)
     );
+{% endif %}
+
+    // ============================================================
+    // User module I/O wires
+    // ============================================================
+{% if input_count > 0 %}
+    // in_bram_buf: raw BRAM data, one WIDTH-bit entry per chunk
+    reg  [WIDTH-1:0]  in_bram_buf [0:INPUT_COUNT-1];
+{% endif %}
+{% if output_count > 0 %}
+    // out_buf: WIDTH-bit chunks to write to output BRAM
+    wire [WIDTH-1:0]  out_buf [0:OUTPUT_COUNT-1];
+{% endif %}
+
+    // ── Data input port wires (assembled from in_bram_buf) ──
+{% for p in input_chunked %}
+    wire [{{ p.width - 1 }}:0] user_in_w_{{ p.name }};
+{% for c in p.chunks %}
+    assign user_in_w_{{ p.name }}[{{ c.hi }}:{{ c.lo }}] = in_bram_buf[{{ c.bram_idx }}][{{ c.hi - c.lo }}:0];
+{% endfor %}
+{% endfor %}
+
+    // ── Data output port wires ──
+{% for p in output_chunked %}
+    wire [{{ p.width - 1 }}:0] user_out_w_{{ p.name }};
+{% endfor %}
+
+    // ── Control output wires ──
+{% for cp in control_output_ports %}
+    wire {% if cp.width > 1 %}[{{ cp.width - 1 }}:0] {% endif %} user_ctrl_out_{{ cp.name }};
+    assign ctrl_{{ cp.name }} = user_ctrl_out_{{ cp.name }};
+{% endfor %}
+
+    // ── out_buf disassembly: user_out_w_* → out_buf[] chunks ──
+{% for p in output_chunked %}
+{% for c in p.chunks %}
+{% set pad = WIDTH - (c.hi - c.lo + 1) %}
+{% if pad > 0 %}
+    assign out_buf[{{ c.bram_idx }}] = { {{ pad }}'d0, user_out_w_{{ p.name }}[{{ c.hi }}:{{ c.lo }}] };
+{% else %}
+    assign out_buf[{{ c.bram_idx }}] = user_out_w_{{ p.name }}[{{ c.hi }}:{{ c.lo }}];
+{% endif %}
+{% endfor %}
+{% endfor %}
+
+    // Handshake
+    reg               user_start_wire;
+    wire              user_done_wire;
+{% if has_busy_port %}
+    wire              user_busy_wire;
+{% endif %}
+
+    // ── Physical device adapter instantiation(s) ──
+{% for ad in adapters %}
+{% if ad.name == 'ps2' %}
+    wire [63:0] ad_ps2_key_state;
+    wire [7:0]  ad_ps2_mod_state;
+    wire        ad_ps2_key_event;
+
+    device_adapter_ps2 u_ps2_adapter (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .ps2_clk    (ps2_clk),
+        .ps2_data   (ps2_data),
+        .key_state  (ad_ps2_key_state),
+        .mod_state  (ad_ps2_mod_state),
+        .key_event  (ad_ps2_key_event)
+    );
+{% elif ad.name == 'uart' %}
+    wire [7:0]  ad_uart_data_byte;
+    wire        ad_uart_data_valid;
+
+    device_adapter_uart #(.BAUD_DIV(108)) u_uart_adapter (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .uart_rx    (uart_rx),
+        .data_byte  (ad_uart_data_byte),
+        .data_valid (ad_uart_data_valid)
+    );
+{% elif ad.name == 'gpio' %}
+    wire        ad_gpio_gpio_event;
+
+    device_adapter_gpio #(.EDGE(1)) u_gpio_adapter (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .gpio_in    (gpio_in),
+        .gpio_event (ad_gpio_gpio_event)
+    );
+{% endif %}
+{% endfor %}
+
+    // ── User module instantiation ──
+    {{ top_module }} u_user (
+{% if has_clock_port %}        .{{ clock_port }} (clk),
+{% endif %}
+{% if has_reset_port %}        .{{ reset_port }} (rst_n),
+{% endif %}
+{% for inp in input_chunked %}
+        .{{ inp.name }}{% if inp.array_count > 1 %} (user_in_w_{{ inp.name }}){% else %} (user_in_w_{{ inp.name }}){% endif %}{% if not loop.last or output_chunked|length > 0 or control_input_ports|length > 0 or control_output_ports|length > 0 or user_has_handshake or adapter_input_ports|length > 0 %},{% endif %}
+{% endfor %}
+{% for ad_name, ports in adapter_input_ports.items() %}
+{% for p in ports %}
+        .{{ p.name }}    (ad_{{ ad_name }}_{{ p.name }}){% if not loop.last or output_chunked|length > 0 or control_input_ports|length > 0 or control_output_ports|length > 0 or user_has_handshake %},{% endif %}
+{% endfor %}
+{% endfor %}
+{% for outp in output_chunked %}
+        .{{ outp.name }}{% if outp.array_count > 1 %} (user_out_w_{{ outp.name }}){% else %} (user_out_w_{{ outp.name }}){% endif %}{% if not loop.last or control_input_ports|length > 0 or control_output_ports|length > 0 or user_has_handshake %},{% endif %}
+{% endfor %}
+{% for cp in control_input_ports %}
+        .{{ cp.name }}    (ctrl_{{ cp.name }}){% if not loop.last or control_output_ports|length > 0 or user_has_handshake %},{% endif %}
+{% endfor %}
+{% for cp in control_output_ports %}
+        .{{ cp.name }}    (user_ctrl_out_{{ cp.name }}){% if not loop.last or user_has_handshake %},{% endif %}
+{% endfor %}
+{% if user_has_handshake %}
+        .{{ start_port }}    (user_start_wire),
+        .{{ done_port }}     (user_done_wire){% if has_busy_port %},
+        .{{ busy_port }}     (user_busy_wire){% endif %}
+{% endif %}
+    );
 
     // ============================================================
     // Control FSM
     // ============================================================
     reg [2:0]         fsm_state;
+{% if input_count > 0 %}
     reg [ADDR_W-1:0]  in_bram_rd_addr;
+    // Port-B read enable for the input BRAM.  Held LOW outside C_LAUNCH so
+    // the BRAM port B does not collide with port-A writes (SIPO or C_DUMP).
+    // Required for collision-checking Xilinx 7-series BRAM models.
+    reg               in_bram_re;
+{% endif %}
+{% if output_count > 0 %}
     reg [ADDR_W-1:0]  out_bram_wr_addr;
     reg [WIDTH-1:0]   out_bram_din;
     reg               out_bram_we;
+    // Port-B read enable for the output BRAM.  Held LOW outside PISO run
+    // so the BRAM port B does not collide with port-A writes in C_DUMP.
+    reg               out_bram_re;
+{% endif %}
 {% if user_has_handshake %}
     reg [IN_IDX_W-1:0]  launch_idx;
     reg [OUT_IDX_W-1:0] dump_idx;
-    reg [1:0]           launch_pipe;  // 0=set_addr, 1=wait, 2=capture
+    reg [1:0]           launch_pipe;
+{% endif %}
+{% if input_count > 0 %}
+    // 1-cycle pulse to SIPO at the end of each batch, resetting
+    // write_count and the synchronizer chain so the next batch can
+    // be captured.  Standard (non-pingpong) wrapper supports
+    // continuous flow via this soft reset between batches.
+    reg               src_arm;
 {% endif %}
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             fsm_state        <= 0;     // C_IDLE
+{% if input_count > 0 %}
             in_bram_rd_addr  <= 0;
+{% endif %}
+{% if output_count > 0 %}
             out_bram_wr_addr <= 0;
             out_bram_din     <= 0;
             out_bram_we      <= 1'b0;
             piso_start       <= 1'b0;
             piso_triggered   <= 1'b0;
+{% endif %}
 {% if user_has_handshake %}
             launch_idx       <= 0;
             dump_idx         <= 0;
             launch_pipe      <= 2'd0;
 {% endif %}
+{% if input_count > 0 %}
+            src_arm   <= 1'b0;
+{% endif %}
         end else begin
+{% if input_count > 0 %}
+            src_arm <= 1'b0;     // default: clear pulse
+            // Port-B read enable: only high during C_LAUNCH when we are
+            // actually consuming the in_bram data.  Otherwise port B is
+            // idle (ENB=0) so the Xilinx collision checker doesn't trip
+            // when SIPO writes to the same address on port A.
+            in_bram_re <= 1'b0;
+{% endif %}
+{% if output_count > 0 %}
             out_bram_we <= 1'b0;
             piso_start  <= 1'b0;
-            // piso_triggered is NOT cleared here — it's only cleared
-            // on reset, ensuring PISO fires exactly once per FPGA config.
+            // Port-B read enable: keep HIGH throughout so the BRAM's
+            // registered DOB is continuously updated.  When the PISO
+            // samples bram_dout in C_DONE / ST_IDLE, it always reads
+            // the latest mem[bram_addr] (no stale/undefined data).
+            // The behavioral RAMB* models and real Xilinx primitives
+            // both support simultaneous port-A write / port-B read on
+            // different addresses without collision.  (Port-B reads
+            // mem[0] while port-A writes mem[1..3] during C_DUMP —
+            // no same-address collision because C_DUMP writes mem[0]
+            // first, and port-B already holds DOB = mem[0] from prior
+            // idle cycles.)
+            out_bram_re <= 1'b1;
+{% endif %}
 
 {% if user_has_handshake %}
-            // FSM transitions
             case (fsm_state)
                 0: begin  // C_IDLE
-                    // Wait for SIPO to finish receiving INPUT_COUNT words
-                    if (sipo_done) begin
+{% if input_count > 0 %}
+                    if (src_done) begin
                         fsm_state <= 1;  // C_LAUNCH
                         in_bram_rd_addr <= 0;
+                        launch_idx <= 0;  // reset for next batch
+                        launch_pipe <= 2'd0;
+                        // Pre-arm port-B read enable one cycle early so
+                        // the BRAM is enabled in time for the first
+                        // C_LAUNCH read (avoids 1-cycle stale-data penalty
+                        // on Xilinx 7-series BRAMs).
+                        in_bram_re <= 1'b1;
                     end
+{% elif input_source == 'adapter' %}
+                    // Bridge mode: wait for trigger key rising edge
+                    // (src_done pulse = 1 cycle).  Each press re-runs
+                    // the FSM from C_COMPUTING onwards.
+                    if (src_done) begin
+                        user_start_wire <= 1'b1;
+                        fsm_state <= 2;  // C_COMPUTING
+                    end
+{% else %}
+                    // No data inputs — pulse start directly
+                    user_start_wire <= 1'b1;
+                    fsm_state <= 2;  // C_COMPUTING
+{% endif %}
                 end
 
+{% if input_count > 0 %}
                 1: begin  // C_LAUNCH
-                    // 3-phase BRAM read pipeline.
-                    // BRAM registered read: dob_reg <= mem[ADDRB] at posedge.
-                    // Non-blocking addr assignment adds 1 more cycle of delay.
-                    // Total latency from "set addr" to "data on dob" = 2 cycles.
-                    // Phase 0: set BRAM address.  Phase 1: wait for BRAM.
-                    // Phase 2: capture in_bram_dob (now reflects addr from phase 0).
-                    // First word uses 2 cycles (addr was primed during C_IDLE).
+                    in_bram_re <= 1'b1;
                     case (launch_pipe)
                         2'd0: begin
-                            // Set address for next read
                             if (launch_idx < INPUT_COUNT) begin
                                 in_bram_rd_addr <= launch_idx;
                             end
-                            // First word: addr 0 was pre-loaded during C_IDLE,
-                            // skip the wait state.
                             if (launch_idx == 0)
-                                launch_pipe <= 2'd2;  // skip to capture
+                                launch_pipe <= 2'd2;
                             else
-                                launch_pipe <= 2'd1;  // wait for BRAM
+                                launch_pipe <= 2'd1;
                         end
                         2'd1: begin
-                            // Wait: BRAM samples address set in phase 0
                             launch_pipe <= 2'd2;
                         end
                         2'd2: begin
-                            // Capture: in_bram_dob now holds the data
                             if (launch_idx < INPUT_COUNT) begin
-                                user_in_reg[launch_idx[IN_IDX_W-1:0]] <= in_bram_dob;
+                                in_bram_buf[launch_idx[IN_IDX_W-1:0]] <= in_bram_dob;
                                 launch_idx <= launch_idx + 1;
                             end
                             launch_pipe <= 2'd0;
@@ -271,18 +528,24 @@ module {{ wrapper_module }} (
                         default: launch_pipe <= 2'd0;
                     endcase
                 end
+{% endif %}
 
                 2: begin  // C_COMPUTING
-                    user_start_wire <= 1'b0;  // deassert start pulse
+                    user_start_wire <= 1'b0;
                     if (user_done_wire) begin
+{% if output_count > 0 %}
                         dump_idx <= 0;
                         fsm_state <= 3;  // C_DUMP
+{% else %}
+                        fsm_state <= 4;  // C_DONE (no outputs)
+{% endif %}
                     end
                 end
 
+{% if output_count > 0 %}
                 3: begin  // C_DUMP
                     if (dump_idx < OUTPUT_COUNT) begin
-                        out_bram_din     <= user_out_lookup;
+                        out_bram_din     <= out_buf[dump_idx];
                         out_bram_we      <= 1'b1;
                         out_bram_wr_addr <= 0;
                         out_bram_wr_addr[OUT_IDX_W-1:0] <= dump_idx;
@@ -297,33 +560,34 @@ module {{ wrapper_module }} (
                         piso_start <= 1'b1;
                         piso_triggered <= 1'b1;
                     end
-                    if (piso_done)
+                    if (piso_done) begin
+{% if input_count > 0 %}
+                        src_arm <= 1'b1;  // pulse SIPO reset for next batch
+{% endif %}
+                        piso_triggered <= 1'b0;  // clear for next PISO run
                         fsm_state <= 0;  // back to C_IDLE
+                    end
                 end
+{% else %}
+                4: begin  // C_DONE (no output PISO)
+                    fsm_state <= 0;
+                end
+{% endif %}
 
                 default: fsm_state <= 0;
             endcase
 {% else %}
-            // Pass-through mode: not implemented in parallel version
+            // Pass-through mode (no handshake): single-cycle compute
+            user_start_wire <= 1'b1;
             fsm_state <= 0;
 {% endif %}
         end
     end
 
-    // Combinational mux: select which user_out_* element to write to
-    // out_bram.  dump_idx walks 0..OUTPUT_COUNT-1.
-    wire [WIDTH-1:0] user_out_lookup;
-    assign user_out_lookup =
-{%- for p in user_output_data_port_names %}{% set outer_out_idx = loop.index0 %}
-    (dump_idx == {{ p.index }}) ? user_out_{{ outer_out_idx }} :
-{%- endfor %}
-    {WIDTH{1'b0}};
-
-{%- if debug %}
-    // Debug status outputs
+{% if debug %}
+    assign overflow = {% if input_count > 0 or input_source == 'adapter' %}src_ovf{% else %}1'b0{% endif %};
     assign idle = (fsm_state == 0);
-    assign busy = (fsm_state != 0) || piso_busy
-{%- if has_busy_port %} || user_busy_wire{% endif %};
-{%- endif %}
+    assign busy = (fsm_state != 0) || piso_busy{% if has_busy_port %} || user_busy_wire{% endif %};
+{% endif %}
 
 endmodule
