@@ -377,7 +377,7 @@ module {{ wrapper_module }} (
     {{ top_module }} u_user (
 {% if has_clock_port %}        .{{ clock_port }} (clk),
 {% endif %}
-{% if has_reset_port %}        .{{ reset_port }} (rst_n),
+{% if has_reset_port %}        .{{ reset_port }} ({% if reset_polarity == 'active_low' %}rst_n{% else %}~rst_n{% endif %}),
 {% endif %}
 {% for inp in input_chunked %}
         .{{ inp.name }}{% if inp.array_count > 1 %} (user_in_w_{{ inp.name }}){% else %} (user_in_w_{{ inp.name }}){% endif %}{% if not loop.last or output_chunked|length > 0 or control_input_ports|length > 0 or control_output_ports|length > 0 or user_has_handshake or adapter_input_ports|length > 0 %},{% endif %}

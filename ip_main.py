@@ -149,6 +149,7 @@ def handle_stream(args) -> int:
                 handshake_ports=_load_handshake_ports(args),
                 sync_mode=args.sync_mode,
                 use_binpack=getattr(args, 'binpack', False),
+                reset_polarity=getattr(args, 'reset_polarity', 'auto'),
             )
     print(json.dumps(result))
     return 0 if result.get('success') else 1
@@ -325,6 +326,12 @@ Examples:
     stream_parser.add_argument('--binpack', action='store_true',
         help='Use FFD bin-packing port marshaling to reduce BRAM entry count '
              'by packing narrow ports into shared entries.')
+    stream_parser.add_argument('--reset-polarity', type=str, default='auto',
+        choices=['auto', 'active_high', 'active_low'],
+        help="User module reset port polarity. 'auto' (default) detects from "
+             "the port name (trailing '_n' → active-low, otherwise active-high). "
+             "Use 'active_high' for ap_rst, 'rst', etc. or 'active_low' for "
+             "rst_n, reset_n, etc.")
     stream_parser.add_argument('--bram-width', '-w', type=int, default=None,
         help='BRAM data width (default: 16). Set to 0 for auto-selection from '
              'valid (width,depth) combinations of the chosen --bram-type.')

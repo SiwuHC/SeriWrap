@@ -654,6 +654,7 @@ def generate_stream_ip(
     handshake_ports: Optional[Dict[str, List[str]]] = None,
     sync_mode: bool = False,
     use_binpack: bool = False,
+    reset_polarity: str = 'auto',
 ) -> Dict[str, Any]:
     """Generate stream wrapper Verilog files for a user module.
 
@@ -871,6 +872,19 @@ def generate_stream_ip(
 
     user_has_handshake = start_port is not None and done_port is not None
 
+    # ── Resolve reset polarity ─────────────────────────────────────
+    _valid_polarities = ('auto', 'active_high', 'active_low')
+    if reset_polarity not in _valid_polarities:
+        return {'success': False, 'error': f"Invalid --reset-polarity '{reset_polarity}'. Valid: {_valid_polarities}"}
+    if reset_polarity == 'auto':
+        # Auto-detect from port name: trailing '_n' → active-low, else active-high
+        if reset_port is None:
+            reset_polarity = 'active_low'   # no reset port → irrelevant, pick safe default
+        elif reset_port.lower().endswith('_n'):
+            reset_polarity = 'active_low'
+        else:
+            reset_polarity = 'active_high'
+
     # Adapter mode override: force input_count = 0 (no Rabbit-fed BRAM
     # entries), so the existing `input_count == 0` path in the wrapper
     # FSM is used (pass-through-like: no C_LAUNCH, start pulses directly).
@@ -1014,6 +1028,7 @@ def generate_stream_ip(
         'reset_port': reset_port,
         'has_clock_port': clock_port is not None,
         'has_reset_port': reset_port is not None,
+        'reset_polarity': reset_polarity,
         'has_busy_port': has_busy_port,
         'input_count': input_count,
         'output_count': output_count,
@@ -1246,6 +1261,13 @@ def main(args_list: Optional[List[str]] = None) -> int:
                         help='Width of the numeric accumulator (only used '
                              'with --input-source adapter for BRAM-depth '
                              'validation). Default: 32.')
+    parser.add_argument('--reset-polarity', type=str, default='auto',
+                        choices=['auto', 'active_high', 'active_low'],
+                        help="User module reset port polarity. 'auto' (default) "
+                             "detects from the port name (trailing '_n' → "
+                             "active-low, otherwise active-high). Use "
+                             "'active_high' for ap_rst, 'rst', etc. or "
+                             "'active_low' for rst_n, reset_n, etc.")
     args = parser.parse_args(args_list)
 
     if args.print_modules:
@@ -1288,6 +1310,7 @@ def main(args_list: Optional[List[str]] = None) -> int:
                 debug=args.debug,
                 control_inputs=ctrl_in,
                 control_outputs=ctrl_out,
+                reset_polarity=args.reset_polarity,
                 pingpong=args.pingpong,
                 bram_type=args.bram_type,
                 adapters=adapters_list,
