@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PLL IP Generator
+PLL SeriWrap
 
 Generates PLL Verilog modules based on:
 - Divide by Value: 2, 4, 8, 16
@@ -180,7 +180,7 @@ def main(args_list: Optional[list[str]] = None) -> int:
         Exit code (0 for success, 1 for error)
     """
     parser = argparse.ArgumentParser(
-        description="PLL IP Generator - Generate PLL Verilog modules",
+        description="PLL SeriWrap - Generate PLL Verilog modules",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

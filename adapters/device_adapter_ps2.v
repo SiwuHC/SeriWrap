@@ -9,7 +9,7 @@
  *  (mod_state).  A single-cycle key_event pulse marks every
  *  state change.
  *
- *  This is the PS/2 adapter for IP-Generator's PDIAL layer.
+ *  This is the PS/2 adapter for SeriWrap's PDIAL layer.
  *  It can be instantiated standalone or wrapped automatically
  *  by stream_generator.generate_stream_ip() when the user
  *  supplies `--adapter ps2:key_state[63:0] mod_state[7:0]`.
@@ -39,7 +39,6 @@ module device_adapter_ps2 #(
     // listed map to index 6'd63 (highest bit in key_state).
     // ----------------------------------------------------------------
     reg [5:0] key_index;
-    reg [5:0] prev_index;
 
     // Standard Scan Code Set 2 → key index
     function [5:0] scancode_to_index;
@@ -235,19 +234,42 @@ module device_adapter_ps2 #(
 
     // Modifier scan codes (kept out of key_state to avoid bitmap
     // collisions; tracked only in mod_state)
+    // ----------------------------------------------------------------
+    // Only update key_state for scan codes that really exist in the lookup
+    // table.  The table's default bucket is index 63, which is ALSO the real
+    // '/' key, so an unmapped code (e.g. the 0x75 of an extended arrow key)
+    // used to squash '/' on press and on release.
+    // ----------------------------------------------------------------
+    function automatic scancode_is_mapped(input [7:0] sc);
+        begin
+            case (sc)
+                8'h76, 8'h05, 8'h06, 8'h04, 8'h0C, 8'h03, 8'h0B, 8'h83,
+                8'h0A, 8'h01, 8'h09, 8'h78, 8'h07, 8'h0E, 8'h16, 8'h1E,
+                8'h26, 8'h25, 8'h2E, 8'h36, 8'h3D, 8'h3E, 8'h46, 8'h45,
+                8'h4E, 8'h55, 8'h66, 8'h0D, 8'h15, 8'h1D, 8'h24, 8'h2D,
+                8'h2C, 8'h35, 8'h3C, 8'h43, 8'h44, 8'h4D, 8'h54, 8'h5B,
+                8'h5A, 8'h14, 8'h1C, 8'h1B, 8'h23, 8'h2B, 8'h34, 8'h33,
+                8'h3B, 8'h42, 8'h4B, 8'h4C, 8'h52, 8'h0F, 8'h12, 8'h1A,
+                8'h22, 8'h21, 8'h2A, 8'h32, 8'h31, 8'h3A, 8'h41, 8'h49,
+                8'h4A:
+                    scancode_is_mapped = 1'b1;
+                default: scancode_is_mapped = 1'b0;
+            endcase
+        end
+    endfunction
+    wire mapped_sc = scancode_is_mapped(ps2_data_byte);
+
     wire is_modifier_sc = is_ctrl_sc || is_shift_sc || is_alt_sc || is_caps_sc;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             key_state  <= {KEY_W{1'b0}};
             mod_state  <= {MOD_W{1'b0}};
-            prev_index <= 6'd0;
             key_event  <= 1'b0;
         end else begin
             key_event <= 1'b0;
             if (press_event) begin
-                prev_index <= key_index;
-                if (!is_modifier_sc)
+                if (!is_modifier_sc && mapped_sc)
                     key_state[key_index] <= 1'b1;
                 if (is_ctrl_sc)  mod_state[0] <= 1'b1;
                 if (is_shift_sc) mod_state[1] <= 1'b1;
@@ -255,7 +277,7 @@ module device_adapter_ps2 #(
                 if (is_caps_sc)  mod_state[3] <= ~mod_state[3];
                 key_event <= 1'b1;
             end else if (release_event) begin
-                if (!is_modifier_sc)
+                if (!is_modifier_sc && mapped_sc)
                     key_state[key_index] <= 1'b0;
                 if (is_ctrl_sc)  mod_state[0] <= 1'b0;
                 if (is_shift_sc) mod_state[1] <= 1'b0;

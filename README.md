@@ -1,6 +1,12 @@
-# IP-Generator
+# SeriWrap
 
-IP-Generator is a companion toolset for **UFDE+**. It generates Verilog IP cores — **Block RAM (BRAM)**, **Phase-Locked Loop (PLL)**, and **Stream Wrapper** — from high-level descriptions, which UFDE+ then instantiates in your design.
+SeriWrap is a standalone Verilog IP-generation toolset. It produces synthesizable
+Verilog IP cores — **Block RAM (BRAM)**, **Phase-Locked Loop (PLL)**, and the
+**SeriWrap stream wrapper** — from high-level descriptions: a memory image, a divide
+ratio, or a plain user Verilog module.
+
+It runs entirely from the command line and has no dependency on any IDE, vendor
+toolchain or project file format.
 
 ---
 
@@ -12,16 +18,22 @@ IP-Generator is a companion toolset for **UFDE+**. It generates Verilog IP cores
 | **PLL IP** | Divide ratio & gate count | `PLL_<divide>_<gates>.v` — clock multiplier module |
 | **Stream IP** | User Verilog module | wrapper + SIPO + PISO + BRAM + top (5 files) |
 
+> The stream wrapper exposes a **ready/valid style outer interface**: `s_ready`
+> tells the host when a new frame may be driven, and each frame is exactly
+> `INPUT_COUNT` words on `s_data_in` and `OUTPUT_COUNT` words on `s_data_out`.
+> The kernel must provide `start`/`done`; everything else is generated.
+
 > **Image → MIF** is a helper utility that produces initialization files for the BRAM generator. It converts PNG / JPG / BMP into the `*.mif` format consumed by `ip_main.py bram`.
 
-The generators are used by UFDE's graphical IP Catalog. You can also run them standalone from the command line.
+Every generator is a plain CLI that prints a single JSON object on stdout, so it can
+equally be driven by a GUI, a Makefile or a CI script.
 
 ---
 
 ## Project Layout
 
 ```
-IP-Generator/
+SeriWrap/
 │
 │  === IP Generation Core ===
 │
@@ -38,9 +50,10 @@ IP-Generator/
 │   ├── stream_piso.j2
 │   ├── stream_wrapper.j2
 │   ├── stream_top.j2
-│   └── stream_bridge_ps2.j2   # PS/2 bridge: SIPO drop-in for --input-source adapter
+│   ├── stream_piso_sync.j2 / stream_sipo_sync.j2   # single-clock variants
+│   └── stream_bridge.j2    # internal: event/PS-2 input bridge (experimental)
 │
-├── ip_generator.spec       # PyInstaller spec for ip_generator.exe
+├── seriwrap.spec       # PyInstaller spec for seriwrap.exe
 └── img2mif.spec            # PyInstaller spec for img2mif.exe
 ```
 
@@ -49,7 +62,7 @@ IP-Generator/
 ## Requirements
 
 - **Python** ≥ 3.8
-- **PyInstaller** (to build the executables UFDE consumes)
+- **PyInstaller** (optional — only to build standalone executables)
 - **jinja2**, **Pillow**
 
 ```bash
@@ -58,13 +71,14 @@ $ pip install pyinstaller jinja2 Pillow
 
 ---
 
-## Building the Executables
+## Building the Executables (optional)
 
-UFDE calls two bundled executables. Build them with PyInstaller using the provided `.spec` files:
+On a machine without a Python environment you can freeze both entry points into
+standalone executables with PyInstaller:
 
 ```bash
-# 1. Unified IP generator (BRAM + PLL + Stream)
-$ pyinstaller ip_generator.spec
+# 1. Unified SeriWrap (BRAM + PLL + Stream)
+$ pyinstaller seriwrap.spec
 
 # 2. Image → MIF converter
 $ pyinstaller img2mif.spec
@@ -74,19 +88,41 @@ After building you will find:
 
 ```
 dist/
-├── ip_generator.exe
+├── seriwrap.exe
 └── img2mif.exe
 ```
 
-### Integration with UFDE
+---
 
-Copy both executables into your `ufde-next` project directory (the exact location depends on how UFDE locates its helper tools; typically alongside the other bundled binaries). UFDE's IP Catalog will then invoke `ip_generator.exe` and `img2mif.exe` transparently when you configure BRAM, PLL, or Stream instances.
+## Rabbit integration
+
+A SeriWrap wrapper is meant to be driven by a host.  Two things make that
+turn-key with the [Rabbit](https://github.com/0xtaruhi/Rabbit) virtual-component
+platform (a copy lives in `BRAM_Test/Rabbit`):
+
+* every `stream` run also writes **`<top>__stream_manifest.json`** next to the
+  wrapper.  It is the machine-readable description of the link: serial word
+  width, words per frame, the exact packing of every word, async vs sync, and
+  which pins carry what.  A host GUI, a testbench or a bring-up script should
+  read this file instead of guessing;
+* `tools/gen_rabbit_project.py` turns that manifest plus the pin-constraint file
+  into a fully bound Rabbit project (`.rbtprj`), and
+  `tools/check_rabbit_project.py` re-derives every expected pin from the
+  constraint file to prove the bindings are right:
+
+  ```bash
+  python3 tools/gen_rabbit_project.py --manifest mac13__stream_manifest.json \
+      --cons mac13_cons.xml --out mac13.rbtprj --name mac13 --bit mac13_bit.bit
+  python3 tools/check_rabbit_project.py --project mac13.rbtprj --cons mac13_cons.xml
+  ```
+
+Rabbit's matching host-side component is `SeriWrap` (see
+`Rabbit/doc/SeriWrapComponent.md`); it speaks the protocol described by the
+manifest, including the `s_ready` back-pressure handshake.
 
 ---
 
-## Standalone Usage
-
-You do not need UFDE to use the generators — they work perfectly from the command line.
+## Usage
 
 ### BRAM from MIF
 
@@ -220,7 +256,7 @@ Symmetric and asymmetric dual-port are supported; total capacity of Port A must 
 
 ## Contributing
 
-To add a new IP generator or modify the template engine, see [`docs/EXTENDING_IP.md`](docs/EXTENDING_IP.md).
+To add a new SeriWrap or modify the template engine, see [`docs/EXTENDING_IP.md`](docs/EXTENDING_IP.md).
 
 ---
 

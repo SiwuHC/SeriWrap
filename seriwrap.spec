@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec file for Unified IP Generator
-# Usage: pyinstaller ip_generator.spec
+# PyInstaller spec file for SeriWrap
+# Usage: pyinstaller seriwrap.spec
 
 block_cipher = None
 
@@ -54,7 +54,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='ip_generator',
+    name='seriwrap',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

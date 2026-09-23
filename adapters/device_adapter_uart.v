@@ -2,7 +2,7 @@
  *  Physical Device I/O Adapter: UART Receiver
  *  File: device_adapter_uart.v
  *
- *  8N1 UART receiver for IP-Generator's PDIAL layer.
+ *  8N1 UART receiver for SeriWrap's PDIAL layer.
  *  Receives serial frames at a fixed baud rate (BAUD_DIV system
  *  clocks per bit), recovers the byte, and exposes it as
  *    data_byte[7:0]   - the most recently received byte (LSB-first frame)
@@ -90,7 +90,11 @@ module device_adapter_uart #(
                 S_DATA: begin
                     baud_cnt <= baud_cnt + 16'd1;
                     if (baud_cnt == BAUD_DIV - 1) begin
-                        baud_cnt <= baud_cnt + 16'd1;   // wraps on next cycle
+                        // Reload for the next data bit.  (This used to do
+                        // "baud_cnt <= baud_cnt + 1" again, so the counter
+                        // never returned to 0 and bits 1..7 were sampled
+                        // 65,536 clocks later.)
+                        baud_cnt <= 16'd0;
                         shift_reg[bit_idx] <= rx_sync[2];
                         if (bit_idx == 4'd7)
                             state <= S_STOP;

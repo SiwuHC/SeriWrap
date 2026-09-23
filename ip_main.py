@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unified IP Generator
+SeriWrap
 
 A unified entry point for generating BRAM, PLL, and Stream IP modules.
 This reduces bundle size by sharing the Jinja2 engine.
@@ -109,6 +109,23 @@ def handle_stream(args) -> int:
                 'error': f"Missing required arguments: {', '.join(missing)}",
                 'message': 'Missing required arguments',
             }
+        elif args.bram_width is not None and args.bram_width < 0:
+            result = {
+                'success': False,
+                'error': (f"--bram-width must be >= 0 (0 means auto, got "
+                          f"{args.bram_width})"),
+                'message': 'Invalid --bram-width',
+            }
+        elif (args.bram_depth is not None and args.bram_depth < 1
+              and not auto_bram):
+            # 0 used to reach math.log2() and die with "math domain error"
+            result = {
+                'success': False,
+                'error': (f"--bram-depth must be >= 1 (got {args.bram_depth}); "
+                          f"omit it, or use --bram-width 0, to let the tool pick "
+                          f"the geometry"),
+                'message': 'Invalid --bram-depth',
+            }
         else:
             ctrl_in = [x.strip() for x in args.control_inputs.split(',') if x.strip()] \
                       if args.control_inputs else None
@@ -129,12 +146,15 @@ def handle_stream(args) -> int:
                 source_file=args.source,
                 top_module=args.top,
                 bram_width=args.bram_width if args.bram_width is not None else 0,
-                bram_depth=args.bram_depth if args.bram_depth is not None else 512,
+                bram_depth=(args.bram_depth
+                            if (args.bram_depth is not None
+                                and not (auto_bram and args.bram_depth < 1))
+                            else 512),
                 out_dir=args.out_dir,
                 baud_div=args.baud_div,
+                width=args.width,          # was parsed but never forwarded
                 baud_div_in=getattr(args, 'baud_div_in', None),
                 baud_div_out=getattr(args, 'baud_div_out', None),
-                idle_timeout=args.idle_timeout,
                 include_sipo=not args.no_sipo,
                 include_piso=not args.no_piso,
                 debug=args.debug,
@@ -148,9 +168,19 @@ def handle_stream(args) -> int:
                 numeric_width=args.numeric_width,
                 handshake_ports=_load_handshake_ports(args),
                 sync_mode=args.sync_mode,
+                ready_signal=not getattr(args, 'no_ready', False),
+                preprocess=getattr(args, 'preprocess', False),
                 use_binpack=getattr(args, 'binpack', False),
                 reset_polarity=getattr(args, 'reset_polarity', 'auto'),
             )
+    # --bram-width 0 selects width AND depth from the primitive's valid set, so
+    # an explicit --bram-depth would be silently ignored: say so.
+    if result.get('success') and getattr(args, 'bram_width', None) == 0 and args.bram_depth is not None:
+        msg = ("--bram-depth is ignored when --bram-width 0 (auto mode picks both "
+               "width and depth from the valid combinations); pass an explicit "
+               "--bram-width to control the depth.")
+        result.setdefault('warnings', []).append(msg)
+        print("WARNING: " + msg, file=sys.stderr)
     print(json.dumps(result))
     return 0 if result.get('success') else 1
 
@@ -158,7 +188,7 @@ def handle_stream(args) -> int:
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='ip_main',
-        description='Unified IP Generator - Generate BRAM and PLL Verilog modules',
+        description='SeriWrap - Generate BRAM and PLL Verilog modules',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -258,8 +288,6 @@ Examples:
         help='Output directory (default: current directory)')
     stream_parser.add_argument('--baud-div', type=int, default=2,
         help='BAUD_DIV parameter for the PISO module (default: 2 for sim)')
-    stream_parser.add_argument('--idle-timeout', type=int, default=2000,
-        help='IDLE_TIMEOUT parameter for the wrapper FSM (default: 2000)')
     stream_parser.add_argument('--no-piso', action='store_true',
         help='Skip the PISO + output BRAM (input-only streaming)')
     stream_parser.add_argument('--no-sipo', action='store_true',
@@ -326,6 +354,13 @@ Examples:
     stream_parser.add_argument('--binpack', action='store_true',
         help='Use FFD bin-packing port marshaling to reduce BRAM entry count '
              'by packing narrow ports into shared entries.')
+    stream_parser.add_argument('--preprocess', action='store_true',
+        help=r'Expand \`define and \`ifdef macros with verilator -E before parsing '
+             '(needed when port widths are written with macros).')
+    stream_parser.add_argument('--no-ready', action='store_true',
+        help='Omit the s_ready back-pressure output (bit-exact reproduction of '
+             'the original 21/69-pin interface; NOT recommended: a producer '
+             'that starts the next frame early then silently loses words).')
     stream_parser.add_argument('--reset-polarity', type=str, default='auto',
         choices=['auto', 'active_high', 'active_low'],
         help="User module reset port polarity. 'auto' (default) detects from "
@@ -333,8 +368,8 @@ Examples:
              "Use 'active_high' for ap_rst, 'rst', etc. or 'active_low' for "
              "rst_n, reset_n, etc.")
     stream_parser.add_argument('--bram-width', '-w', type=int, default=None,
-        help='BRAM data width (default: 16). Set to 0 for auto-selection from '
-             'valid (width,depth) combinations of the chosen --bram-type.')
+        help='BRAM data width (REQUIRED unless 0 = auto-select). Set to 0 to '
+             'let the tool pick a valid (width,depth) pair for --bram-type.')
     stream_parser.add_argument('--bram-depth', type=int, default=None,
         help='BRAM depth (optional with --bram-width 0, auto-selected).')
 

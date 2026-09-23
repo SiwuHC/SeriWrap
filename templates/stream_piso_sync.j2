@@ -1,6 +1,6 @@
 /*==============================================================
  *  File: stream_piso.v  (sync-mode — no baud-rate serial clock)
- *  Author: UFDE+ IP Generator
+ *  Author: SeriWrap
  *  Date: {{ generation_date }}
  *==============================================================*/
 `timescale 1ns / 1ps
@@ -46,6 +46,14 @@ module {{ top_module }}__stream_piso #(
     reg [ADDR_W-1:0] word_cnt;
     reg              running;
 
+    // One word per system clock.  bram_addr deliberately LEADS word_cnt by
+    // one: every memory this tool emits has a 1-clock registered read, so the
+    // data for word N appears on bram_dout exactly one clock after its
+    // address is presented.  Presenting addr = N+1 while word_cnt = N gives
+    //   bram_dout(cycle T) = mem[addr(T-1)] = mem[N]
+    // i.e. the word that must be shifted out at this clock.  (The previous
+    // version presented addr = N and only worked with the old, combinational
+    // generic RAM model; with a registered read it repeated the first word.)
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             bram_addr    <= 0;
@@ -62,20 +70,22 @@ module {{ top_module }}__stream_piso #(
                 running      <= 1'b1;
                 busy         <= 1'b1;
                 word_cnt     <= 0;
-                bram_addr    <= 0;
+                bram_addr    <= 1;          // word 0's data is on dout next cycle
                 s_data_valid <= 1'b0;
             end else if (running) begin
-                // Pipeline: bram_addr was set last cycle, bram_dout is now valid
                 s_data_valid <= 1'b1;
                 s_data_out   <= bram_dout;
                 if (word_cnt == COUNT - 1) begin
                     running      <= 1'b0;
                     busy         <= 1'b0;
-                    s_data_valid <= 1'b0;
+                    // NOTE: s_data_valid must NOT be cleared here — the final
+                    // word is being latched into s_data_out on this very edge
+                    // and the consumer samples it on the next clock.  It is
+                    // cleared by the idle branch one cycle later.
                     done         <= 1'b1;
                 end else begin
                     word_cnt  <= word_cnt + 1;
-                    bram_addr <= bram_addr + 1;
+                    bram_addr <= word_cnt + 2;   // keep the address one ahead
                 end
             end else begin
                 s_data_valid <= 1'b0;

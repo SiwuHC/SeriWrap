@@ -39,42 +39,81 @@ def generate_preview(data, output_path):
 
 def generate_preview_from_mif(mif_path, output_path):
     data = parse_mif_file(mif_path)
-    
-    if len(data) != 1024:
-        print(f"Warning: MIF data size is {len(data)}, expected 1024 bytes")
-    
-    generate_preview(data, output_path)
+
+    if len(data) < 1024:
+        print(f"Warning: MIF data size is {len(data)}, expected at least 1024 bytes")
+        data = data + [0] * (1024 - len(data))
+    elif len(data) > 1024:
+        print(f"Warning: MIF has {len(data)} entries; preview uses the first 1024")
+
+    generate_preview(data[:1024], output_path)
+
+
+def _radix_to_base(radix):
+    return {'HEX': 16, 'DEC': 10, 'UNS': 10, 'BIN': 2, 'OCT': 8}.get(radix, 16)
 
 
 def parse_mif_file(mif_path):
-    data = []
+    """Parse a MIF into an address-indexed byte list (DEPTH entries).
+
+    The old version appended values in file order with a hard-coded base 16,
+    so it ignored ADDRESS_RADIX/DATA_RADIX, could not handle "[a..b] : v"
+    ranges (the file's own test MIFs use them) and silently produced a
+    one-element list.  Ranges are expanded and every value is placed at its
+    declared address now.
+    """
+    import re as _re
+    addr_radix, data_radix, depth = 'DEC', 'HEX', None
+    entries = []          # (start_addr, end_addr, value)
     in_content = False
-    
-    with open(mif_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            
-            if not line or line.startswith('--'):
+    with open(mif_path, 'r') as fh:
+        for raw in fh:
+            line = raw.split('--')[0].strip()
+            if not line:
                 continue
-            
-            if line.upper().startswith('CONTENT BEGIN'):
+            up = line.upper()
+            if up.startswith('CONTENT BEGIN'):
                 in_content = True
                 continue
-            
-            if line.upper() == 'END;':
-                in_content = False
+            if up.startswith('END'):
+                break
+            if not in_content:
+                for part in line.split(';'):
+                    if '=' in part:
+                        k, v = [x.strip() for x in part.split('=', 1)]
+                        k = k.upper()
+                        if k == 'DEPTH':
+                            depth = int(v, 0)
+                        elif k == 'ADDRESS_RADIX':
+                            addr_radix = v.upper()
+                        elif k == 'DATA_RADIX':
+                            data_radix = v.upper()
                 continue
-            
-            if in_content and ':' in line:
-                parts = line.split(':')
-                if len(parts) >= 2:
-                    value_str = parts[1].strip().rstrip(';')
-                    try:
-                        value = int(value_str, 16)
-                        data.append(value)
-                    except ValueError:
-                        pass
-    
+            if ':' not in line:
+                continue
+            lhs, rhs = line.split(':', 1)
+            lhs = lhs.strip()
+            rhs = rhs.strip().rstrip(';').strip()
+            base_a, base_d = _radix_to_base(addr_radix), _radix_to_base(data_radix)
+            try:
+                value = int(rhs, base_d)
+            except ValueError:
+                continue
+            m = _re.match(r'^\[\s*([0-9A-Fa-f]+)\s*\.\.\s*([0-9A-Fa-f]+)\s*\]$', lhs)
+            if m:
+                entries.append((int(m.group(1), base_a), int(m.group(2), base_a), value))
+            else:
+                try:
+                    a = int(lhs, base_a)
+                except ValueError:
+                    continue
+                entries.append((a, a, value))
+    size = depth if depth else (max((e for _, e, _ in entries), default=-1) + 1)
+    size = max(size, 1024)          # the graphic-LCD preview wants 1024 bytes
+    data = [0] * size
+    for a, b, v in entries:
+        for addr in range(a, min(b, size - 1) + 1):
+            data[addr] = v
     return data
 
 

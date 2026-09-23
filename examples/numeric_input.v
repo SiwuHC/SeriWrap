@@ -15,7 +15,7 @@
  *
  *  Pair with: --input-source adapter --trigger-key enter
  *
- *  Note: value width is hardcoded 32 so the IP-Generator's Verilog
+ *  Note: value width is hardcoded 32 so SeriWrap's Verilog
  *  parser can resolve the bit-width (parameter-driven ranges are
  *  treated as 1-bit by the parser).  If you change this, also
  *  update --bram-width/depth to keep ceil(32 / WIDTH) ≤ depth.

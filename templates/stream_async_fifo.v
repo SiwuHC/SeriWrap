@@ -1,7 +1,7 @@
 /*==============================================================
  *  Description: Generic Gray-coded asynchronous FIFO.
  *  File: stream_async_fifo.v
- *  Author: UFDE+ Stream IP Generator (hand-written primitive)
+ *  Author: SeriWrap (hand-written primitive)
  *
  *  Standard 2-FF synchronised Gray-coded async FIFO (Cliff Cummings
  *  "Simulation and Synthesis Techniques for Asynchronous FIFO Design"
@@ -60,8 +60,15 @@ module stream_async_fifo #(
     // Empty / full comparators (Gray-coded, one-bit MSB distinguishes)
     // ----------------------------------------------------------------
     wire r_empty_comb = (r_ptr_gray == w_ptr_gray_sync_1);
-    wire w_full_comb  = (w_ptr_gray == {~r_ptr_gray_sync_1[ADDR_W],
-                                          r_ptr_gray_sync_1[ADDR_W-1:0]});
+    // Full = the NEXT write pointer would catch up with the synchronised read
+    // pointer, i.e. the two Gray codes differ in the TOP TWO bits (Cummings,
+    // SNUG 2002).  Inverting only the MSB (the previous code) makes the flag
+    // assert after 2*DEPTH writes, so DEPTH unread words were silently
+    // overwritten before any backpressure.  Requires ADDR_W >= 2.
+    wire [ADDR_W:0] w_full_target = {~r_ptr_gray_sync_1[ADDR_W],
+                                     ~r_ptr_gray_sync_1[ADDR_W-1],
+                                      r_ptr_gray_sync_1[ADDR_W-2:0]};
+    wire w_full_comb  = (w_ptr_gray_next == w_full_target);
 
     // ----------------------------------------------------------------
     // Write domain
