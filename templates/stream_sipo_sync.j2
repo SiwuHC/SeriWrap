@@ -11,9 +11,19 @@
  *
  *  Unlike the standard SIPO which uses a Gray-coded async FIFO for
  *  cross-domain safety, the sync variant assumes `clk_in` == `clk`
- *  and writes `data_in` directly into BRAM on cycles where
- *  `strobe_in` is high.  This eliminates the ~100 LUT async-FIFO
- *  overhead for designs that do not need clock-domain crossing.
+ *  and writes `data_in` directly into BRAM.  This eliminates the
+ *  ~100 LUT async-FIFO overhead for designs that do not need
+ *  clock-domain crossing.
+ *
+ *  One word per STROBE RISING EDGE, not per strobe-high clock.  A host
+ *  whose pins only change once per USB frame cannot guarantee that
+ *  "strobe high" lasts exactly one system clock: the Rabbit GUI, for
+ *  instance, holds each frame for several FPGA clocks, and a level
+ *  sensitive SIPO then stores the same word several times (a 64-word
+ *  frame completes after ~13 words and the kernel computes on a
+ *  stretched frame).  Edge detection makes the word boundary belong to
+ *  the host, so the frame is right for a one-clock strobe and for a long
+ *  one alike.
  *
  *  Parameters:
  *    WIDTH        - bit width of each parallel data word
@@ -47,6 +57,11 @@ module {{ top_module }}__stream_sipo #(
     input  wire               batch_arm
 );
 
+    reg  strobe_d;
+
+    // one word per rising edge of strobe_in
+    wire strobe_edge = strobe_in & ~strobe_d;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             bram_addr    <= 0;
@@ -55,6 +70,7 @@ module {{ top_module }}__stream_sipo #(
             write_count  <= 0;
             done         <= 1'b0;
             overflow     <= 1'b0;
+            strobe_d     <= 1'b0;
         end else if (batch_arm) begin
             bram_addr    <= 0;
             bram_din     <= 0;
@@ -62,19 +78,21 @@ module {{ top_module }}__stream_sipo #(
             write_count  <= 0;
             done         <= 1'b0;
             overflow     <= 1'b0;
+            strobe_d     <= 1'b0;
         end else begin
             bram_we  <= 1'b0;
             done     <= 1'b0;
             overflow <= 1'b0;
+            strobe_d <= strobe_in;
 
-            if (strobe_in && write_count < COUNT) begin
+            if (strobe_edge && write_count < COUNT) begin
                 bram_we     <= 1'b1;
                 bram_din    <= data_in;
                 bram_addr   <= write_count;
                 write_count <= write_count + 1'b1;
                 if (write_count == COUNT - 1)
                     done <= 1'b1;
-            end else if (write_count >= COUNT && strobe_in) begin
+            end else if (write_count >= COUNT && strobe_edge) begin
                 overflow <= 1'b1;
             end
         end
