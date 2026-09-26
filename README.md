@@ -350,10 +350,8 @@ in [`templates/`](templates) and the generator in `stream_generator.py`.
 
 ## 11. Author
 
-* [@FrancisCYH](https://github.com/FrancisCYH) — IP-Generator: BRAM, PLL and the
-  original stream wrapper.
-* [@SiwuHC](https://github.com/SiwuHC) — SeriWrap: stream wrapper rework, the host
-  manifest contract, and the virtual-component integration.
+* [@FrancisCYH](https://github.com/FrancisCYH) — IP-Generator: BRAM, PLL.
+* [@SiwuHC](https://github.com/SiwuHC) — SeriWrap: stream wrapper.
 
 ## 12. Host integration
 
