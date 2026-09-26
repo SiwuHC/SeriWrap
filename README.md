@@ -63,9 +63,9 @@ $ pyinstaller img2mif.spec
 ```
 
 Release builds for Linux and Windows are produced by
-\`.github/workflows/release.yml\`: pushing a tag \`v*\` builds both with PyInstaller on their
+`.github/workflows/release.yml`: pushing a tag `v*` builds both with PyInstaller on their
 own runner (PyInstaller cannot cross compile) and attaches
-\`seriwrap-linux-x86_64.tar.gz\` / \`seriwrap-windows-x86_64.zip\` to the GitHub release.  A
+`seriwrap-linux-x86_64.tar.gz` / `seriwrap-windows-x86_64.zip` to the GitHub release.  A
 manual run of the workflow builds the artifacts without publishing a release.
 
 After a local build you will find:
@@ -324,7 +324,7 @@ ports into one BRAM entry when their bits fit together.
 | `--no-ready` | off | omit `s_ready` (reproduces the old 21/69-pin interface; not recommended) |
 | `--debug` | off | extra overflow/idle/busy ports |
 | `--print-modules` | — | list modules/ports and exit |
-| `--preprocess` | off | expand `\`define`/`\`ifdef` with `verilator -E` first |
+| `--preprocess` | off | expand ``define`/``ifdef` with `verilator -E` first |
 | `--control-inputs` / `--control-outputs` | — | ports to route through the control path instead of the frame |
 | `--handshake-config` | — | JSON file mapping clock/reset/start/done/busy roles to port names |
 | `--clock-ports`, `--reset-ports`, `--start-ports`, `--done-ports`, `--busy-ports` | — | override one role (comma separated names) |
