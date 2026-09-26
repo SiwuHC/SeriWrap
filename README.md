@@ -31,7 +31,7 @@ This document describes the generators and their options.
 |-----------|---------|-------|--------|
 | Block RAM | `ip_main.py bram` | MIF memory image | `test.v` — synthesizable RAM module |
 | PLL | `ip_main.py pll` | divide ratio, FPGA gate count | `PLL_<divide>_<gates>.v` |
-| Stream wrapper | `ip_main.py stream` | user Verilog module | wrapper + SIPO + PISO + BRAM + top + JSON manifest |
+| Stream wrapper | `ip_main.py stream` | user Verilog module | wrapper + SIPO + PISO + BRAM + top (plus a manifest with `--emit-manifest`) |
 | Image to MIF | `img2mif.py` | PNG / JPG / BMP | `*.mif` for the BRAM generator |
 
 A stream wrapper exposes a ready/valid outer interface: `s_ready` tells the host
@@ -209,7 +209,8 @@ python3 ip_main.py stream \
     --source my_kernel.v --top my_kernel \
     --bram-width 8 --bram-depth 512 --bram-type ram4s \
     --binpack --sync-mode \
-    --out-dir ./out/
+    --out-dir ./out/          #  add --emit-manifest if the host should read
+                              #  the link description instead of hard-coding it
 ```
 
 The command prints one JSON object on stdout (`success`, `files`, `message`, ...),
@@ -255,22 +256,12 @@ out; `s_ready` stays low while that is happening.
 | `<top>__stream_piso.v` | output side: BRAM → serial words |
 | `<top>__stream_bram.v` | BRAM primitive instances |
 | `stream_async_fifo.v` | async mode only (SIPO clock-domain crossing) |
-| `<top>__stream_manifest.json` | **the host contract** (8.4) |
+| `<top>__stream_manifest.json` | **only with `--emit-manifest`**: machine-readable description of the link |
 | `<top>__stream_mapping.txt` | human-readable port ↔ word map |
 
-#### 8.4 The manifest is the host contract
+#### 8.4 Optional: the machine-readable manifest
 
-| key | meaning |
-|-----|---------|
-| `link.width` | serial word width (8 / 16 / 32) |
-| `link.sync_mode` | `true`: one word per `STROBE` rising edge; `false`: 3-phase `s_clk_in` handshake |
-| `frame.input_words` / `output_words` | how many words one frame is |
-| `frame.handshake.ready` | whether the wrapper has `s_ready` |
-| `ports.inputs` / `ports.outputs` | the *kernel* ports and their widths |
-| `packing.input` / `packing.output` | which bits of which port every serial word carries |
-
-Anything that reads this file can pack a frame, drive the pins and decode the
-answer without knowing anything else about the design.
+`--emit-manifest` also writes `<top>__stream_manifest.json`, the mapping document in JSON form: `link` (word width, sync/async), `frame` (words per frame, handshake), `ports` (kernel ports and widths) and `packing` (which bits of which port each word carries).  It is off by default: a host that hard-codes the frame size does not need it, a GUI or bring-up script that would rather read the description does.
 
 #### 8.5 Words, ports and widths
 
@@ -318,6 +309,7 @@ ports into one BRAM entry when their bits fit together.
 | `--bram-width`, `-w` | *(required, or 0)* | BRAM / word width; `0` lets the tool pick a valid (width, depth) pair for the chosen `--bram-type` |
 | `--bram-depth` | *(with a width)* | BRAM depth; auto-selected when `--bram-width 0` |
 | `--bram-type` | `ram4s` | `ram4s`, `ram8b`, `ramb18e1`, `ramb36e1`, `generic` |
+| `--emit-manifest` | off | also write `<top>__stream_manifest.json` (8.4) |
 | `--binpack` | off | pack narrow ports into shared BRAM entries |
 | `--sync-mode` | off | sync SIPO/PISO (see 8.7) |
 | `--baud-div` / `--baud-div-in` / `--baud-div-out` | 2 | serial clock dividers |
@@ -379,25 +371,13 @@ in [`templates/`](templates) and the generator in `stream_generator.py`.
 
 ## 12. Host integration
 
-A generated wrapper is ordinary synthesizable Verilog, so any host that can drive
-its pins will do.  Two files keep that host honest:
+A generated wrapper is ordinary synthesizable Verilog, so any host that can drive its
+pins will do: with `--emit-manifest` it can read the frame size, packing and mode from
+`<top>__stream_manifest.json` instead of hard-coding them (`<top>__stream_mapping.txt` is
+the same information for a human); the sync word boundary is a `STROBE` pulse, the async one
+is the `s_clk_in` period, and the host waits for `s_ready` before the next frame.
 
-* **`<top>__stream_manifest.json`** — written by every `stream` run next to the
-  wrapper.  It states the serial word width, the number of words per frame, the
-  exact packing of every word, async vs sync, and whether `s_ready` is present, so
-  a GUI, a testbench or a bring-up script can drive the link without guessing;
-* **`<top>__stream_mapping.txt`** — the same information in human-readable form.
-
-`tools/gen_rabbit_project.py` turns the manifest plus a pin-constraint file into a
-project file for the [Rabbit](https://github.com/0xtaruhi/Rabbit)
-virtual-component platform, and `tools/check_rabbit_project.py` re-derives every
-expected pin from the constraint file to prove the bindings are right:
-
-```bash
-python3 tools/gen_rabbit_project.py --manifest <top>__stream_manifest.json \
-    --cons <top>_cons.xml --out <top>.rbtprj --name <top> --bit <top>_yosys_bit.bit
-python3 tools/check_rabbit_project.py --project <top>.rbtprj --cons <top>_cons.xml
-```
-
-Any other host — a script driving the board over USB, a simulation testbench — can
-read the same manifest and speak the same protocol.
+`tools/gen_rabbit_project.py` and `tools/check_rabbit_project.py` turn such a manifest plus a
+pin-constraint file into a bound project for the
+[Rabbit](https://github.com/0xtaruhi/Rabbit) virtual-component platform and verify the
+bindings afterwards.

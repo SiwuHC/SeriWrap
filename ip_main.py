@@ -167,6 +167,7 @@ def handle_stream(args) -> int:
                 trigger_key=args.trigger_key,
                 numeric_width=args.numeric_width,
                 handshake_ports=_load_handshake_ports(args),
+                emit_manifest=args.emit_manifest,
                 sync_mode=args.sync_mode,
                 ready_signal=not getattr(args, 'no_ready', False),
                 preprocess=getattr(args, 'preprocess', False),
@@ -351,6 +352,11 @@ Examples:
     stream_parser.add_argument('--baud-div-out', type=int, default=None,
         help='PISO output baud divider (default: same as --baud-div). '
              'Higher values reduce output pin toggling.')
+    stream_parser.add_argument('--emit-manifest', action='store_true',
+        help='Also write <top>__stream_manifest.json, a machine-readable description '
+             'of the link (word width, words per frame, packing, sync/async, pins). '
+             'Off by default: only hosts that read the description instead of '
+             'hard-coding it need it.')
     stream_parser.add_argument('--binpack', action='store_true',
         help='Use FFD bin-packing port marshaling to reduce BRAM entry count '
              'by packing narrow ports into shared entries.')

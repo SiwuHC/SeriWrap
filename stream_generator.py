@@ -987,6 +987,7 @@ def generate_stream_ip(
     ready_signal: bool = True,
     reset_polarity: str = 'auto',
     preprocess: bool = False,
+    emit_manifest: bool = False,
 ) -> Dict[str, Any]:
     """Generate stream wrapper Verilog files for a user module.
 
@@ -1750,32 +1751,35 @@ def generate_stream_ip(
                            bram_width, bram_depth,
                            num_in_brams, num_out_brams,
                            input_count, output_count)
-        # ── Generate the machine-readable manifest (same information, for
-        #    programs: host GUIs, testbenches, bring-up scripts) ──────────
-        _write_manifest(out_dir, top_module,
-                        input_chunks_flat=input_chunks_flat,
-                        output_chunks_flat=output_chunks_flat,
-                        bram_width=bram_width, bram_depth=bram_depth,
-                        num_in_brams=num_in_brams,
-                        num_out_brams=num_out_brams,
-                        input_count=input_count, output_count=output_count,
-                        storage_mode=('pingpong' if pingpong else
-                                      ('register_file' if use_regfile else 'bram')),
-                        bram_type=bram_type,
-                        sync_mode=sync_mode,
-                        input_source=input_source_norm,
-                        baud_div=baud_div,
-                        baud_div_in=baud_div_in,
-                        baud_div_out=baud_div_out,
-                        data_input_ports=data_input_ports,
-                        data_output_ports=data_output_ports,
-                        clock_port=clock_port, reset_port=reset_port,
-                        reset_polarity=reset_polarity,
-                        start_port=start_port, done_port=done_port,
-                        ready_signal=ready_signal,
-                        adapters=adapters)
-        files_written.append(
-            os.path.join(out_dir, f'{top_module}__stream_manifest.json'))
+        # ── Optional machine-readable description of the link (same
+        #    information as the mapping doc, for programs) ────────────
+        if emit_manifest:
+            # ── Generate the machine-readable manifest (same information, for
+            #    programs: host GUIs, testbenches, bring-up scripts) ──────────
+            _write_manifest(out_dir, top_module,
+                            input_chunks_flat=input_chunks_flat,
+                            output_chunks_flat=output_chunks_flat,
+                            bram_width=bram_width, bram_depth=bram_depth,
+                            num_in_brams=num_in_brams,
+                            num_out_brams=num_out_brams,
+                            input_count=input_count, output_count=output_count,
+                            storage_mode=('pingpong' if pingpong else
+                                          ('register_file' if use_regfile else 'bram')),
+                            bram_type=bram_type,
+                            sync_mode=sync_mode,
+                            input_source=input_source_norm,
+                            baud_div=baud_div,
+                            baud_div_in=baud_div_in,
+                            baud_div_out=baud_div_out,
+                            data_input_ports=data_input_ports,
+                            data_output_ports=data_output_ports,
+                            clock_port=clock_port, reset_port=reset_port,
+                            reset_polarity=reset_polarity,
+                            start_port=start_port, done_port=done_port,
+                            ready_signal=ready_signal,
+                            adapters=adapters)
+            files_written.append(
+                os.path.join(out_dir, f'{top_module}__stream_manifest.json'))
     except OSError as e:
         return {'success': False, 'error': str(e), 'message': f'Cannot write to {out_dir}'}
 
