@@ -1,0 +1,81 @@
+name: Release binaries
+
+# Linux and Windows builds of the two entry points.  PyInstaller cannot cross
+# compile, so each platform is built on its own runner; both are attached to the
+# GitHub release of the tag.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:        # manual run: builds the artifacts, no release
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            slug: linux-x86_64
+          - os: windows-latest
+            slug: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip pyinstaller jinja2 Pillow
+
+      - name: Build executables
+        run: |
+          pyinstaller --clean --noconfirm seriwrap.spec
+          pyinstaller --clean --noconfirm img2mif.spec
+
+      - name: Sanity check
+        shell: bash
+        run: |
+          dist="./dist"
+          test -x "$dist/seriwrap" -o -f "$dist/seriwrap.exe"
+          test -x "$dist/img2mif"   -o -f "$dist/img2mif.exe"
+          ls -l "$dist"
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: tar -C dist -czf seriwrap-${{ matrix.slug }}.tar.gz seriwrap img2mif
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/seriwrap.exe,dist/img2mif.exe -DestinationPath seriwrap-${{ matrix.slug }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seriwrap-${{ matrix.slug }}
+          path: seriwrap-${{ matrix.slug }}.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -l artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false

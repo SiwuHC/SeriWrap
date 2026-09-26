@@ -62,7 +62,13 @@ $ pyinstaller seriwrap.spec
 $ pyinstaller img2mif.spec
 ```
 
-After building you will find:
+Release builds for Linux and Windows are produced by
+\`.github/workflows/release.yml\`: pushing a tag \`v*\` builds both with PyInstaller on their
+own runner (PyInstaller cannot cross compile) and attaches
+\`seriwrap-linux-x86_64.tar.gz\` / \`seriwrap-windows-x86_64.zip\` to the GitHub release.  A
+manual run of the workflow builds the artifacts without publishing a release.
+
+After a local build you will find:
 
 ```
 dist/
