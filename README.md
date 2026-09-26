@@ -16,7 +16,7 @@ toolchain or project file format.
 |-----------|-------|--------|
 | **BRAM IP** | MIF file (memory initialization) | `test.v` — synthesizable Verilog RAM module |
 | **PLL IP** | Divide ratio & gate count | `PLL_<divide>_<gates>.v` — clock multiplier module |
-| **Stream IP** | User Verilog module | wrapper + SIPO + PISO + BRAM + top (5 files) |
+| **Stream IP** | User Verilog module | wrapper + SIPO + PISO + BRAM + top + a JSON manifest for the host |
 
 > The stream wrapper exposes a **ready/valid style outer interface**: `s_ready`
 > tells the host when a new frame may be driven, and each frame is exactly
@@ -201,37 +201,161 @@ $ python ip_main.py pll --all --output-dir ./generated
 | `divide` | 2, 4, 8, 16 | Clock divide ratio |
 | `gates` | 30, 50 | 30 = 30W (DLL primitive), 50 = 50W (DCM primitive) |
 
-### Stream IP
+### Stream IP — wrap a kernel behind a serial link
 
-Wraps a user Verilog module with SIPO + PISO + dual-port BRAM, exposing a parallel N-bit serial interface (DATA + CLK + STROBE / DATA + CLK + DATA_VALID). Auto-detects data port width, input/output counts, and `start` / `done` / `busy` handshake ports. Use `--width` only if the module uses parameterized port widths that cannot be auto-detected.
+`ip_main.py stream` turns a plain Verilog module (your *kernel*) into an IP core
+with a serial outer interface: SIPO + PISO + dual-port BRAM around the kernel, so
+a host that can only change a few pins per transaction can still deliver a whole
+input frame and read a whole output frame.
+
+#### 1. Quick start
 
 ```bash
-# List modules and ports
-$ python ip_main.py stream --source *.v --print-modules
+# what is in my file?  (modules, ports, widths, handshake ports)
+python3 ip_main.py stream --source my_kernel.v --print-modules
 
-# Generate wrapper (width auto-detected from first data port)
-$ python ip_main.py stream \
-    --source *.v \
-    --top matrix_mult_3x3 \
-    --bram-width 8 \
-    --bram-depth 512 \
-    --out-dir ./generated/
+# generate the wrapper: 8-bit words, 512-deep BRAM, sync link
+python3 ip_main.py stream \
+    --source my_kernel.v --top my_kernel \
+    --bram-width 8 --bram-depth 512 --bram-type ram4s \
+    --binpack --sync-mode \
+    --out-dir ./out/
 ```
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--source` | *(required)* | Path to user Verilog source |
-| `--top` | *(required)* | Top module name to wrap |
-| `--bram-width` | 16 | BRAM data width |
-| `--bram-depth` | 256 | BRAM depth |
-| `--width` | 0 (auto) | Data port width override (0 = auto-detect from module) |
-| `--baud-div` | 2 | System clocks per PISO CLK half-period |
-| `--out-dir` | `.` | Output directory |
-| `--debug` | — | Include overflow/idle/busy debug ports |
-| `--print-modules` | — | Print module list and exit |
+The command prints one JSON object on stdout (`success`, `files`, `message`, ...),
+so a Makefile, a GUI or a CI job can drive it just as well as a shell.
 
-For a complete guide including protocol specification and simulation, see [STREAM_IP_GUIDE.md](STREAM_IP_GUIDE.md).
+#### 2. What the kernel has to look like
 
+* a clock / reset pair (`clk`, `rst_n` by default — names are configurable),
+* `start` in, `done` out (and optionally `busy`),
+* data inputs and one or more data outputs; every input port becomes part of the
+  input frame and every output port part of the output frame,
+* port widths written as literal ranges (`[31:0]`).  Parameterised widths are
+  treated as 1 bit by the parser: pass `--width`, or `--preprocess` to expand
+  macros with `verilator -E` first.
+
+```verilog
+module my_kernel (
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire        start,
+    output reg         done,
+    input  wire [31:0] a0, a1, a2, a3,
+    output reg  [31:0] y0
+);
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin done <= 1'b0; y0 <= 32'h0; end
+    else begin done <= start; if (start) y0 <= a0 + a1 + a2 + a3; end
+  end
+endmodule
+```
+
+The wrapper holds `start` for one cycle as soon as the whole input frame has
+arrived, waits for `done`, dumps the outputs into the output buffer and shifts them
+out; `s_ready` stays low while that is happening.
+
+#### 3. What gets generated
+
+| file | content |
+|------|---------|
+| `<top>__stream_top.v` | top level: wrapper + serial pins |
+| `<top>__stream_wrapper.v` | frame FSM (receive → start → wait `done` → dump → shift out) |
+| `<top>__stream_sipo.v` | input side: serial words → BRAM |
+| `<top>__stream_piso.v` | output side: BRAM → serial words |
+| `<top>__stream_bram.v` | BRAM primitive instances |
+| `stream_async_fifo.v` | async mode only (SIPO clock-domain crossing) |
+| `<top>__stream_manifest.json` | **the host contract** (section 4) |
+| `<top>__stream_mapping.txt` | human-readable port ↔ word map |
+
+#### 4. The manifest is the host contract
+
+| key | meaning |
+|-----|---------|
+| `link.width` | serial word width (8 / 16 / 32) |
+| `link.sync_mode` | `true`: one word per `STROBE` rising edge; `false`: 3-phase `s_clk_in` handshake |
+| `frame.input_words` / `output_words` | how many words one frame is |
+| `frame.handshake.ready` | whether the wrapper has `s_ready` |
+| `ports.inputs` / `ports.outputs` | the *kernel* ports and their widths |
+| `packing.input` / `packing.output` | which bits of which port every serial word carries |
+
+Anything that reads this file can pack a frame, drive the pins and decode the
+answer without knowing anything else about the design.
+
+#### 5. Words, ports and widths
+
+A kernel *port* is not the same thing as a serial *word*.  With `--bram-width 8`,
+a 32-bit `a0` spans four words, so sixteen such ports make a 64-word frame; with a
+16-bit link each port is two words.  Packing is one-to-one — one port, one word —
+only when the port width equals the word width.  `--binpack` packs several narrow
+ports into one BRAM entry when their bits fit together.
+
+#### 6. Choosing the link
+
+| option | effect |
+|--------|--------|
+| `--bram-width` | word width; required, or `0` to auto-select a valid pair |
+| `--bram-depth` | BRAM depth (auto with `--bram-width 0`); the frame must fit, so depth ≥ words per frame |
+| `--bram-type` | `ram4s` (Spartan-6 / FDP3P7 style), `ram8b`, `ramb18e1`, `ramb36e1`, `generic` (behavioural, for simulation) |
+| `--sync-mode` | lightweight SIPO/PISO: no async FIFO, no `s_clk_in` baud clock, `CLK_OUT` tied low, word boundary = `STROBE` edge |
+| `--binpack` | FFD bin-packing of the port marshalling |
+| `--baud-div`, `--baud-div-in`, `--baud-div-out` | serial clock dividers (async mode) |
+| `--pingpong` | two buffers, so a frame can be loaded while the previous one is computed |
+| `--no-sipo`, `--no-piso` | build a single direction only |
+
+#### 7. Driving it from a host
+
+* **sync mode** — put the word on the data pins, raise `STROBE` for one system
+  clock, drop it again, and leave at least one clock before the next word.  The
+  sync SIPO writes on the **rising edge** of `STROBE`, so a host whose pins only
+  change once per transaction (a USB frame, a GUI tick) may hold the strobe as
+  long as it likes: the pulse, not the level, defines the word.  `s_clk_out` is
+  tied low and `s_data_valid` marks each output word.
+* **async mode** — three phases per word (data + strobe high, `s_clk_in` high,
+  everything low), held for `--baud-div` (or `--baud-div-in/-out`) clocks; the
+  word boundary is the host's own serial clock.
+* wait for `s_ready` before starting the next frame — the wrapper drops it while
+  it computes.
+
+#### 8. All `stream` options
+
+| option | default | description |
+|--------|---------|-------------|
+| `--source`, `-s` | *(required)* | user Verilog source |
+| `--top`, `-t` | *(required)* | module to wrap |
+| `--out-dir` | `.` | output directory |
+| `--width` | 0 (auto) | data port width override |
+| `--bram-width`, `-w` | *(required, or 0)* | BRAM / word width; `0` lets the tool pick a valid (width, depth) pair for the chosen `--bram-type` |
+| `--bram-depth` | *(with a width)* | BRAM depth; auto-selected when `--bram-width 0` |
+| `--bram-type` | `ram4s` | `ram4s`, `ram8b`, `ramb18e1`, `ramb36e1`, `generic` |
+| `--binpack` | off | pack narrow ports into shared BRAM entries |
+| `--sync-mode` | off | sync SIPO/PISO (see section 7) |
+| `--baud-div` / `--baud-div-in` / `--baud-div-out` | 2 | serial clock dividers |
+| `--pingpong` | off | double-buffered wrapper |
+| `--no-sipo` / `--no-piso` | off | omit one direction |
+| `--no-ready` | off | omit `s_ready` (reproduces the old 21/69-pin interface; not recommended) |
+| `--debug` | off | extra overflow/idle/busy ports |
+| `--print-modules` | — | list modules/ports and exit |
+| `--preprocess` | off | expand `\`define`/`\`ifdef` with `verilator -E` first |
+| `--control-inputs` / `--control-outputs` | — | ports to route through the control path instead of the frame |
+| `--handshake-config` | — | JSON file mapping clock/reset/start/done/busy roles to port names |
+| `--clock-ports`, `--reset-ports`, `--start-ports`, `--done-ports`, `--busy-ports` | — | override one role (comma separated names) |
+
+#### 9. Troubleshooting
+
+| symptom | likely cause |
+|---------|--------------|
+| values are wrong but deterministic | host pacing vs. mode: in sync mode the strobe must be a *pulse* with a gap between words; in async mode the word boundary is `s_clk_in` |
+| nothing comes back at all | the wrapper never saw a whole input frame (it starts only after `input_words` words) — check `s_ready` and the word count against the manifest |
+| the tool cannot find ports | widths written with parameters/macros: use `--preprocess` or `--width` |
+| placement/routing errors on the target | `--bram-type` does not match the device; `generic` is for simulation only |
+| the kernel never starts | the handshake ports are named differently: check `--handshake-config` / `--*-ports` |
+
+#### 10. Legacy: `--input-source adapter` (deprecated)
+
+The PS/2 keyboard bridge (`--input-source adapter --adapter ps2:...`) is an early
+experiment kept for reference: it is event driven, one batch per keypress, and no
+longer maintained.  New designs should use the default `--input-source rabbit`.
 ---
 
 ## Supported BRAM Configurations
