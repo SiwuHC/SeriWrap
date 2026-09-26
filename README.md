@@ -94,34 +94,6 @@ dist/
 
 ---
 
-## Rabbit integration
-
-A SeriWrap wrapper is meant to be driven by a host.  Two things make that
-turn-key with the [Rabbit](https://github.com/0xtaruhi/Rabbit) virtual-component
-platform (a copy lives in `BRAM_Test/Rabbit`):
-
-* every `stream` run also writes **`<top>__stream_manifest.json`** next to the
-  wrapper.  It is the machine-readable description of the link: serial word
-  width, words per frame, the exact packing of every word, async vs sync, and
-  which pins carry what.  A host GUI, a testbench or a bring-up script should
-  read this file instead of guessing;
-* `tools/gen_rabbit_project.py` turns that manifest plus the pin-constraint file
-  into a fully bound Rabbit project (`.rbtprj`), and
-  `tools/check_rabbit_project.py` re-derives every expected pin from the
-  constraint file to prove the bindings are right:
-
-  ```bash
-  python3 tools/gen_rabbit_project.py --manifest mac13__stream_manifest.json \
-      --cons mac13_cons.xml --out mac13.rbtprj --name mac13 --bit mac13_bit.bit
-  python3 tools/check_rabbit_project.py --project mac13.rbtprj --cons mac13_cons.xml
-  ```
-
-Rabbit's matching host-side component is `SeriWrap` (see
-`Rabbit/doc/SeriWrapComponent.md`); it speaks the protocol described by the
-manifest, including the `s_ready` back-pressure handshake.
-
----
-
 ## Usage
 
 ### BRAM from MIF
@@ -388,3 +360,30 @@ in [`templates/`](templates) and the generator in `stream_generator.py`.
 ## Author
 
 [@FrancisCYH](https://github.com/FrancisCYH)
+
+---
+
+## Host integration
+
+A generated wrapper is ordinary synthesizable Verilog, so any host that can drive
+its pins will do.  Two files keep that host honest:
+
+* **`<top>__stream_manifest.json`** — written by every `stream` run next to the
+  wrapper.  It states the serial word width, the number of words per frame, the
+  exact packing of every word, async vs sync, and whether `s_ready` is present, so
+  a GUI, a testbench or a bring-up script can drive the link without guessing;
+* **`<top>__stream_mapping.txt`** — the same information in human-readable form.
+
+`tools/gen_rabbit_project.py` turns the manifest plus a pin-constraint file into a
+project file for the [Rabbit](https://github.com/0xtaruhi/Rabbit)
+virtual-component platform, and `tools/check_rabbit_project.py` re-derives every
+expected pin from the constraint file to prove the bindings are right:
+
+```bash
+python3 tools/gen_rabbit_project.py --manifest <top>__stream_manifest.json \
+    --cons <top>_cons.xml --out <top>.rbtprj --name <top> --bit <top>_yosys_bit.bit
+python3 tools/check_rabbit_project.py --project <top>.rbtprj --cons <top>_cons.xml
+```
+
+Any other host — a script driving the board over USB, a simulation testbench — can
+read the same manifest and speak the same protocol.
