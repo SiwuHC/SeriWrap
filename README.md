@@ -256,7 +256,8 @@ Symmetric and asymmetric dual-port are supported; total capacity of Port A must 
 
 ## Contributing
 
-To add a new SeriWrap or modify the template engine, see [`docs/EXTENDING_IP.md`](docs/EXTENDING_IP.md).
+To add a new SeriWrap or change the template engine, start from the templates
+in [`templates/`](templates) and the generator in `stream_generator.py`.
 
 ---
 
