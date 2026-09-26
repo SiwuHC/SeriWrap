@@ -322,3 +322,48 @@ ports into one BRAM entry when their bits fit together.
 | `--control-inputs` / `--control-outputs` | — | ports to route through the control path instead of the frame |
 | `--handshake-config` | — | JSON file mapping clock/reset/start/done/busy roles to port names |
 | `--clock-ports`, `--reset-ports`, `--start-ports`, `--done-ports`, `--busy-ports` | — | override one role (comma separated names) |
+
+---
+
+## 9. Supported BRAM configurations
+
+Based on the 4Kb `RAMB4_Sx` primitive. Up to 16 primitives can be combined in parallel.
+
+### Single-Port (25 configurations)
+
+| Capacity | width × depth |
+|----------|---------------|
+| 4Kb  | 1×4096, 2×2048, 4×1024, 8×512, 16×256 |
+| 8Kb  | 2×4096, 4×2048, 8×1024, 16×512, 32×256 |
+| 16Kb | 4×4096, 8×2048, 16×1024, 32×512, 64×256 |
+| 32Kb | 8×4096, 16×2048, 32×1024, 64×512, 128×256 |
+| 64Kb | 16×4096, 32×2048, 64×1024, 128×512, 256×256 |
+
+### Dual-Port (75 configurations)
+
+Symmetric and asymmetric dual-port are supported; total capacity of Port A must equal Port B.
+
+## 10. Contributing
+
+To add a new SeriWrap or change the template engine, start from the templates
+in [`templates/`](templates) and the generator in `stream_generator.py`.
+
+## 11. Author
+
+* [@FrancisCYH](https://github.com/FrancisCYH) — IP-Generator: BRAM, PLL and the
+  original stream wrapper.
+* [@SiwuHC](https://github.com/SiwuHC) — SeriWrap: stream wrapper rework, the host
+  manifest contract, and the virtual-component integration.
+
+## 12. Host integration
+
+A generated wrapper is ordinary synthesizable Verilog, so any host that can drive its
+pins will do: with `--emit-manifest` it can read the frame size, packing and mode from
+`<top>__stream_manifest.json` instead of hard-coding them (`<top>__stream_mapping.txt` is
+the same information for a human); the sync word boundary is a `STROBE` pulse, the async one
+is the `s_clk_in` period, and the host waits for `s_ready` before the next frame.
+
+`tools/gen_rabbit_project.py` and `tools/check_rabbit_project.py` turn such a manifest plus a
+pin-constraint file into a bound project for the
+[Rabbit](https://github.com/0xtaruhi/Rabbit) virtual-component platform and verify the
+bindings afterwards.
