@@ -1,36 +1,76 @@
 # SeriWrap
 
-SeriWrap is a standalone Verilog IP-generation toolset. It produces synthesizable
-Verilog IP cores — **Block RAM (BRAM)**, **Phase-Locked Loop (PLL)**, and the
-**SeriWrap stream wrapper** — from high-level descriptions: a memory image, a divide
-ratio, or a plain user Verilog module.
+SeriWrap is a Verilog IP generator: it emits synthesizable Verilog for a block RAM,
+a PLL, or a wrapper that puts a user module behind a serial link, from a short
+description (a memory image, a divide ratio, a plain user module).  Each generator is
+a plain command line tool that prints one JSON object on stdout, so it can be driven
+by a shell, a Makefile, a GUI or a CI job.
 
-It runs entirely from the command line and has no dependency on any IDE, vendor
-toolchain or project file format.
+This document describes the generators and their options.
 
----
+## Contents
 
-## What It Does
-
-| Generator | Input | Output |
-|-----------|-------|--------|
-| **BRAM IP** | MIF file (memory initialization) | `test.v` — synthesizable Verilog RAM module |
-| **PLL IP** | Divide ratio & gate count | `PLL_<divide>_<gates>.v` — clock multiplier module |
-| **Stream IP** | User Verilog module | wrapper + SIPO + PISO + BRAM + top + a JSON manifest for the host |
-
-> The stream wrapper exposes a **ready/valid style outer interface**: `s_ready`
-> tells the host when a new frame may be driven, and each frame is exactly
-> `INPUT_COUNT` words on `s_data_in` and `OUTPUT_COUNT` words on `s_data_out`.
-> The kernel must provide `start`/`done`; everything else is generated.
-
-> **Image → MIF** is a helper utility that produces initialization files for the BRAM generator. It converts PNG / JPG / BMP into the `*.mif` format consumed by `ip_main.py bram`.
-
-Every generator is a plain CLI that prints a single JSON object on stdout, so it can
-equally be driven by a GUI, a Makefile or a CI script.
+1. [Generators](#1-generators)
+2. [Requirements and build](#2-requirements-and-build)
+3. [Repository layout](#3-repository-layout)
+4. [Command line interface](#4-command-line-interface)
+5. [BRAM generator](#5-bram-generator)
+6. [PLL generator](#6-pll-generator)
+7. [Image to MIF helper](#7-image-to-mif-helper)
+8. [Stream wrapper](#8-stream-wrapper)
+9. [Supported BRAM configurations](#9-supported-bram-configurations)
+10. [Contributing](#10-contributing)
+11. [Author](#11-author)
+12. [Host integration](#12-host-integration)
 
 ---
 
-## Project Layout
+## 1. Generators
+
+| Generator | Command | Input | Output |
+|-----------|---------|-------|--------|
+| Block RAM | `ip_main.py bram` | MIF memory image | `test.v` — synthesizable RAM module |
+| PLL | `ip_main.py pll` | divide ratio, FPGA gate count | `PLL_<divide>_<gates>.v` |
+| Stream wrapper | `ip_main.py stream` | user Verilog module | wrapper + SIPO + PISO + BRAM + top + JSON manifest |
+| Image to MIF | `img2mif.py` | PNG / JPG / BMP | `*.mif` for the BRAM generator |
+
+A stream wrapper exposes a ready/valid outer interface: `s_ready` tells the host
+when a new frame may be driven, a frame is exactly `INPUT_COUNT` words on
+`s_data_in` and `OUTPUT_COUNT` words on `s_data_out`, and the wrapped module only
+has to provide `start` / `done`.
+
+## 2. Requirements and build
+
+- **Python** ≥ 3.8
+- **PyInstaller** (optional — only to build standalone executables)
+- **jinja2**, **Pillow**
+
+```bash
+$ pip install pyinstaller jinja2 Pillow
+```
+
+### Building the executables (optional)
+
+On a machine without a Python environment you can freeze both entry points into
+standalone executables with PyInstaller:
+
+```bash
+# 1. Unified SeriWrap (BRAM + PLL + Stream)
+$ pyinstaller seriwrap.spec
+
+# 2. Image → MIF converter
+$ pyinstaller img2mif.spec
+```
+
+After building you will find:
+
+```
+dist/
+├── seriwrap.exe
+└── img2mif.exe
+```
+
+## 3. Repository layout
 
 ```
 SeriWrap/
@@ -57,46 +97,23 @@ SeriWrap/
 └── img2mif.spec            # PyInstaller spec for img2mif.exe
 ```
 
----
-
-## Requirements
-
-- **Python** ≥ 3.8
-- **PyInstaller** (optional — only to build standalone executables)
-- **jinja2**, **Pillow**
+## 4. Command line interface
 
 ```bash
-$ pip install pyinstaller jinja2 Pillow
+python3 ip_main.py bram   <mif> [options]        # block RAM
+python3 ip_main.py pll    [options]              # PLL
+python3 ip_main.py stream --source <file.v> --top <module> [options]
 ```
 
----
+* every subcommand prints **one JSON object** on stdout
+  (`success`, `files`, `message`, and `error` when it fails) and exits non-zero on
+  failure, so callers never have to parse prose;
+* `--help` lists the options of a subcommand; they are also tabulated in the
+  sections below;
+* `ip_main.py stream --print-modules` only lists the modules and ports found in a
+  Verilog file and exits — the quickest way to see what the parser understands.
 
-## Building the Executables (optional)
-
-On a machine without a Python environment you can freeze both entry points into
-standalone executables with PyInstaller:
-
-```bash
-# 1. Unified SeriWrap (BRAM + PLL + Stream)
-$ pyinstaller seriwrap.spec
-
-# 2. Image → MIF converter
-$ pyinstaller img2mif.spec
-```
-
-After building you will find:
-
-```
-dist/
-├── seriwrap.exe
-└── img2mif.exe
-```
-
----
-
-## Usage
-
-### BRAM from MIF
+## 5. BRAM generator
 
 ```bash
 $ python ip_main.py bram input.mif --output bram.v
@@ -138,7 +155,23 @@ CONTENT BEGIN
 END;
 ```
 
-#### Preparing a MIF from an image
+## 6. PLL generator
+
+```bash
+# Single configuration
+$ python ip_main.py pll --divide 2 --gates 30 --output PLL_2_30.v
+
+# All combinations (4 divide values × 2 gate counts = 8 files)
+$ python ip_main.py pll --all --output-dir ./generated
+```
+
+| Parameter | Values | Description |
+|-----------|--------|-------------|
+| `divide` | 2, 4, 8, 16 | Clock divide ratio |
+| `gates` | 30, 50 | 30 = 30W (DLL primitive), 50 = 50W (DCM primitive) |
+
+## 7. Image to MIF helper
+### Preparing a MIF from an image
 
 If your BRAM will store graphic data, use `img2mif.py` to create the initialization file first:
 
@@ -158,29 +191,14 @@ $ python img2mif.py -t checker -o checker.mif -p preview.png
 
 Then pass the resulting `*.mif` to `ip_main.py bram` as shown above.
 
-### PLL (limited testing)
-
-```bash
-# Single configuration
-$ python ip_main.py pll --divide 2 --gates 30 --output PLL_2_30.v
-
-# All combinations (4 divide values × 2 gate counts = 8 files)
-$ python ip_main.py pll --all --output-dir ./generated
-```
-
-| Parameter | Values | Description |
-|-----------|--------|-------------|
-| `divide` | 2, 4, 8, 16 | Clock divide ratio |
-| `gates` | 30, 50 | 30 = 30W (DLL primitive), 50 = 50W (DCM primitive) |
-
-### Stream IP — wrap a kernel behind a serial link
+## 8. Stream wrapper
 
 `ip_main.py stream` turns a plain Verilog module (your *kernel*) into an IP core
 with a serial outer interface: SIPO + PISO + dual-port BRAM around the kernel, so
 a host that can only change a few pins per transaction can still deliver a whole
 input frame and read a whole output frame.
 
-#### 1. Quick start
+#### 8.1 Quick start
 
 ```bash
 # what is in my file?  (modules, ports, widths, handshake ports)
@@ -197,7 +215,7 @@ python3 ip_main.py stream \
 The command prints one JSON object on stdout (`success`, `files`, `message`, ...),
 so a Makefile, a GUI or a CI job can drive it just as well as a shell.
 
-#### 2. What the kernel has to look like
+#### 8.2 What the kernel has to look like
 
 * a clock / reset pair (`clk`, `rst_n` by default — names are configurable),
 * `start` in, `done` out (and optionally `busy`),
@@ -227,7 +245,7 @@ The wrapper holds `start` for one cycle as soon as the whole input frame has
 arrived, waits for `done`, dumps the outputs into the output buffer and shifts them
 out; `s_ready` stays low while that is happening.
 
-#### 3. What gets generated
+#### 8.3 What gets generated
 
 | file | content |
 |------|---------|
@@ -237,10 +255,10 @@ out; `s_ready` stays low while that is happening.
 | `<top>__stream_piso.v` | output side: BRAM → serial words |
 | `<top>__stream_bram.v` | BRAM primitive instances |
 | `stream_async_fifo.v` | async mode only (SIPO clock-domain crossing) |
-| `<top>__stream_manifest.json` | **the host contract** (section 4) |
+| `<top>__stream_manifest.json` | **the host contract** (8.4) |
 | `<top>__stream_mapping.txt` | human-readable port ↔ word map |
 
-#### 4. The manifest is the host contract
+#### 8.4 The manifest is the host contract
 
 | key | meaning |
 |-----|---------|
@@ -254,7 +272,7 @@ out; `s_ready` stays low while that is happening.
 Anything that reads this file can pack a frame, drive the pins and decode the
 answer without knowing anything else about the design.
 
-#### 5. Words, ports and widths
+#### 8.5 Words, ports and widths
 
 A kernel *port* is not the same thing as a serial *word*.  With `--bram-width 8`,
 a 32-bit `a0` spans four words, so sixteen such ports make a 64-word frame; with a
@@ -262,7 +280,7 @@ a 32-bit `a0` spans four words, so sixteen such ports make a 64-word frame; with
 only when the port width equals the word width.  `--binpack` packs several narrow
 ports into one BRAM entry when their bits fit together.
 
-#### 6. Choosing the link
+#### 8.6 Choosing the link
 
 | option | effect |
 |--------|--------|
@@ -275,7 +293,7 @@ ports into one BRAM entry when their bits fit together.
 | `--pingpong` | two buffers, so a frame can be loaded while the previous one is computed |
 | `--no-sipo`, `--no-piso` | build a single direction only |
 
-#### 7. Driving it from a host
+#### 8.7 Driving it from a host
 
 * **sync mode** — put the word on the data pins, raise `STROBE` for one system
   clock, drop it again, and leave at least one clock before the next word.  The
@@ -289,7 +307,7 @@ ports into one BRAM entry when their bits fit together.
 * wait for `s_ready` before starting the next frame — the wrapper drops it while
   it computes.
 
-#### 8. All `stream` options
+#### 8.8 All `stream` options
 
 | option | default | description |
 |--------|---------|-------------|
@@ -301,7 +319,7 @@ ports into one BRAM entry when their bits fit together.
 | `--bram-depth` | *(with a width)* | BRAM depth; auto-selected when `--bram-width 0` |
 | `--bram-type` | `ram4s` | `ram4s`, `ram8b`, `ramb18e1`, `ramb36e1`, `generic` |
 | `--binpack` | off | pack narrow ports into shared BRAM entries |
-| `--sync-mode` | off | sync SIPO/PISO (see section 7) |
+| `--sync-mode` | off | sync SIPO/PISO (see 8.7) |
 | `--baud-div` / `--baud-div-in` / `--baud-div-out` | 2 | serial clock dividers |
 | `--pingpong` | off | double-buffered wrapper |
 | `--no-sipo` / `--no-piso` | off | omit one direction |
@@ -313,7 +331,7 @@ ports into one BRAM entry when their bits fit together.
 | `--handshake-config` | — | JSON file mapping clock/reset/start/done/busy roles to port names |
 | `--clock-ports`, `--reset-ports`, `--start-ports`, `--done-ports`, `--busy-ports` | — | override one role (comma separated names) |
 
-#### 9. Troubleshooting
+#### 8.9 Troubleshooting
 
 | symptom | likely cause |
 |---------|--------------|
@@ -323,14 +341,13 @@ ports into one BRAM entry when their bits fit together.
 | placement/routing errors on the target | `--bram-type` does not match the device; `generic` is for simulation only |
 | the kernel never starts | the handshake ports are named differently: check `--handshake-config` / `--*-ports` |
 
-#### 10. Legacy: `--input-source adapter` (deprecated)
+#### 8.10 Legacy: `--input-source adapter` (deprecated)
 
 The PS/2 keyboard bridge (`--input-source adapter --adapter ps2:...`) is an early
 experiment kept for reference: it is event driven, one batch per keypress, and no
 longer maintained.  New designs should use the default `--input-source rabbit`.
----
 
-## Supported BRAM Configurations
+## 9. Supported BRAM configurations
 
 Based on the 4Kb `RAMB4_Sx` primitive. Up to 16 primitives can be combined in parallel.
 
@@ -348,22 +365,19 @@ Based on the 4Kb `RAMB4_Sx` primitive. Up to 16 primitives can be combined in pa
 
 Symmetric and asymmetric dual-port are supported; total capacity of Port A must equal Port B.
 
----
-
-## Contributing
+## 10. Contributing
 
 To add a new SeriWrap or change the template engine, start from the templates
 in [`templates/`](templates) and the generator in `stream_generator.py`.
 
----
+## 11. Author
 
-## Author
+* [@FrancisCYH](https://github.com/FrancisCYH) — IP-Generator: BRAM, PLL and the
+  original stream wrapper.
+* [@SiwuHC](https://github.com/SiwuHC) — SeriWrap: stream wrapper rework, the host
+  manifest contract, and the virtual-component integration.
 
-[@FrancisCYH](https://github.com/FrancisCYH)
-
----
-
-## Host integration
+## 12. Host integration
 
 A generated wrapper is ordinary synthesizable Verilog, so any host that can drive
 its pins will do.  Two files keep that host honest:
