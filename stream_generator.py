@@ -1700,12 +1700,17 @@ def generate_stream_ip(
                  open(adapter_dst_path, 'w', encoding='utf-8') as fdst:
                 fdst.write(fsrc.read())
 
-    # Copy the async FIFO primitive (used by stream_sipo.v) into out_dir.
-    # This is a hand-written Verilog module shared by all SIPO instances.
+    # Copy the async FIFO primitive into out_dir, but only when the design
+    # really uses it: the async SIPO is the only block that drags a foreign clock
+    # domain through it.  Sync mode, the adapter bridge and SIPO-less designs
+    # never instantiate it, so writing the file there would just leave an unused
+    # module next to the wrapper.
+    needs_async_fifo = (include_sipo and not sync_mode
+                        and input_source_norm == 'rabbit')
     ASYNC_FIFO_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'templates', 'stream_async_fifo.v')
-    if os.path.isfile(ASYNC_FIFO_SRC):
-        async_fifo_dst = os.path.join(out_dir, 'stream_async_fifo.v')
+    async_fifo_dst = os.path.join(out_dir, 'stream_async_fifo.v')
+    if needs_async_fifo and os.path.isfile(ASYNC_FIFO_SRC):
         with open(ASYNC_FIFO_SRC, 'r', encoding='utf-8') as fsrc, \
              open(async_fifo_dst, 'w', encoding='utf-8') as fdst:
             fdst.write(fsrc.read())
@@ -1713,15 +1718,14 @@ def generate_stream_ip(
     files_written = [wrapper_path, top_path]
     if include_piso:
         files_written.append(piso_path)
-        files_written.append(os.path.join(out_dir, 'stream_async_fifo.v'))
     if bram_result is not None:
         files_written.insert(0, bram_path)
     if input_source_norm == 'adapter':
         files_written.append(bridge_path)
     elif include_sipo:
         files_written.append(src_path)
-        if os.path.join(out_dir, 'stream_async_fifo.v') not in files_written:
-            files_written.append(os.path.join(out_dir, 'stream_async_fifo.v'))
+    if needs_async_fifo:
+        files_written.append(async_fifo_dst)
     for ad in adapters:
         files_written.append(os.path.join(out_dir, f"device_adapter_{ad['name']}.v"))
 

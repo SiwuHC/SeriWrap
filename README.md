@@ -261,7 +261,7 @@ out; `s_ready` stays low while that is happening.
 | `<top>__stream_sipo.v` | input side: serial words → BRAM |
 | `<top>__stream_piso.v` | output side: BRAM → serial words |
 | `<top>__stream_bram.v` | BRAM primitive instances |
-| `stream_async_fifo.v` | async mode only (SIPO clock-domain crossing) |
+| `stream_async_fifo.v` | only for async wrappers: the clock-domain crossing FIFO the async SIPO instantiates |
 | `<top>__stream_manifest.json` | **only with `--emit-manifest`**: machine-readable description of the link |
 | `<top>__stream_mapping.txt` | human-readable port ↔ word map |
 
