@@ -168,7 +168,8 @@ def handle_stream(args) -> int:
                 numeric_width=args.numeric_width,
                 handshake_ports=_load_handshake_ports(args),
                 emit_manifest=args.emit_manifest,
-                force_bram=args.force_bram,
+                force_bram=(args.force_bram or args.bram_width is not None),
+                force_regfile=args.reg_file,
                 sync_mode=args.sync_mode,
                 ready_signal=not getattr(args, 'no_ready', False),
                 preprocess=getattr(args, 'preprocess', False),
@@ -353,6 +354,10 @@ Examples:
     stream_parser.add_argument('--baud-div-out', type=int, default=None,
         help='PISO output baud divider (default: same as --baud-div). '
              'Higher values reduce output pin toggling.')
+    stream_parser.add_argument('--reg-file', action='store_true',
+        help='Let the generator pick the register-file wrapper for small frames even '
+             'when --bram-width was given (default: an explicit --bram-width keeps the '
+             'BRAM wrapper).')
     stream_parser.add_argument('--force-bram', action='store_true',
         help='Use the BRAM wrapper even when the frame is small enough for the '
              'register-file wrapper.  The BRAM path instantiates the BRAM primitive '

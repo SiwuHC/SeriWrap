@@ -989,6 +989,7 @@ def generate_stream_ip(
     preprocess: bool = False,
     emit_manifest: bool = False,
     force_bram: bool = False,
+    force_regfile: bool = False,
 ) -> Dict[str, Any]:
     """Generate stream wrapper Verilog files for a user module.
 
@@ -1334,7 +1335,10 @@ def generate_stream_ip(
     # A device adapter can only be wired into the BRAM wrapper; --force-bram lets
     # a caller ask for the BRAM path explicitly (the register-file path leaves a
     # memory cell for the next tool to map, the BRAM path emits the primitive).
-    force_bram_wrapper = bool(adapters) or force_bram
+    # A device adapter can only live in the BRAM wrapper.  --force-bram (and, on the
+    # CLI side, simply passing --bram-width) says "use the BRAM path"; an explicit
+    # register-file request re-enables the size-based heuristic.
+    force_bram_wrapper = (bool(adapters) or force_bram) and not force_regfile
 
     # ── Auto-select BRAM config if width=0 ─────────────────────────
     if bram_width <= 0:
