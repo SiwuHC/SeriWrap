@@ -168,6 +168,7 @@ def handle_stream(args) -> int:
                 numeric_width=args.numeric_width,
                 handshake_ports=_load_handshake_ports(args),
                 emit_manifest=args.emit_manifest,
+                force_bram=args.force_bram,
                 sync_mode=args.sync_mode,
                 ready_signal=not getattr(args, 'no_ready', False),
                 preprocess=getattr(args, 'preprocess', False),
@@ -352,6 +353,10 @@ Examples:
     stream_parser.add_argument('--baud-div-out', type=int, default=None,
         help='PISO output baud divider (default: same as --baud-div). '
              'Higher values reduce output pin toggling.')
+    stream_parser.add_argument('--force-bram', action='store_true',
+        help='Use the BRAM wrapper even when the frame is small enough for the '
+             'register-file wrapper.  The BRAM path instantiates the BRAM primitive '
+             'directly instead of leaving a memory for the next tool to map.')
     stream_parser.add_argument('--emit-manifest', action='store_true',
         help='Also write <top>__stream_manifest.json, a machine-readable description '
              'of the link (word width, words per frame, packing, sync/async, pins). '

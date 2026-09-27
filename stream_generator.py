@@ -988,6 +988,7 @@ def generate_stream_ip(
     reset_polarity: str = 'auto',
     preprocess: bool = False,
     emit_manifest: bool = False,
+    force_bram: bool = False,
 ) -> Dict[str, Any]:
     """Generate stream wrapper Verilog files for a user module.
 
@@ -1330,7 +1331,10 @@ def generate_stream_ip(
     # Device adapters are only implemented in the standard (BRAM) wrapper;
     # the register-file wrapper has no adapter ports/instances, which used to
     # make the top-level fail with PINNOTFOUND.  Force the BRAM path.
-    force_bram_wrapper = bool(adapters)
+    # A device adapter can only be wired into the BRAM wrapper; --force-bram lets
+    # a caller ask for the BRAM path explicitly (the register-file path leaves a
+    # memory cell for the next tool to map, the BRAM path emits the primitive).
+    force_bram_wrapper = bool(adapters) or force_bram
 
     # ── Auto-select BRAM config if width=0 ─────────────────────────
     if bram_width <= 0:

@@ -316,6 +316,7 @@ ports into one BRAM entry when their bits fit together.
 | `--bram-depth` | *(with a width)* | BRAM depth; auto-selected when `--bram-width 0` |
 | `--bram-type` | `ram4s` | `ram4s`, `ram8b`, `ramb18e1`, `ramb36e1`, `generic` |
 | `--emit-manifest` | off | also write `<top>__stream_manifest.json` (8.4) |
+| `--force-bram` | off | use the BRAM wrapper even for small frames (see 8.6) |
 | `--binpack` | off | pack narrow ports into shared BRAM entries |
 | `--sync-mode` | off | sync SIPO/PISO (see 8.7) |
 | `--baud-div` / `--baud-div-in` / `--baud-div-out` | 2 | serial clock dividers |
